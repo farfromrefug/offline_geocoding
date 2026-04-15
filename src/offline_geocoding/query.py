@@ -40,7 +40,7 @@ import math
 import sqlite3
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from .schema import apply_pragmas, decompress_json
+from .schema import LAT_LON_SCALE, IMPORTANCE_SCALE, apply_pragmas, decompress_json
 
 # ---------------------------------------------------------------------------
 # Connection helper
@@ -242,9 +242,11 @@ def _format_place(
         "osm_key": row["osm_key"],
         "osm_value": row["osm_value"],
         "address_type": row["address_type"],
-        "importance": row["importance"],
-        "lat": row["lat"],
-        "lon": row["lon"],
+        # Stored as INTEGER (×IMPORTANCE_SCALE); convert back to float.
+        "importance": row["importance"] / IMPORTANCE_SCALE,
+        # Stored as INTEGER (×LAT_LON_SCALE); convert back to float degrees.
+        "lat": row["lat"] / LAT_LON_SCALE,
+        "lon": row["lon"] / LAT_LON_SCALE,
         "bbox": (
             row["bbox_min_lon"],
             row["bbox_min_lat"],
@@ -311,6 +313,7 @@ def search(
 
         if bbox is not None:
             min_lon, min_lat, max_lon, max_lat = bbox
+            # lat/lon are stored as INTEGER (×LAT_LON_SCALE); scale the bounds.
             sql = """
                 SELECT p.*
                 FROM places_fts fts
@@ -323,8 +326,8 @@ def search(
             """
             params = (
                 fts_query,
-                min_lat, max_lat,
-                min_lon, max_lon,
+                round(min_lat * LAT_LON_SCALE), round(max_lat * LAT_LON_SCALE),
+                round(min_lon * LAT_LON_SCALE), round(max_lon * LAT_LON_SCALE),
                 limit, offset,
             )
         else:
@@ -413,6 +416,13 @@ def reverse(
         min_lon = lon - radius_deg
         max_lon = lon + radius_deg
 
+        # p.lat / p.lon are INTEGER (×LAT_LON_SCALE); convert query coords too
+        # so dist_sq is in (1e-6 °)² units and ordering is still correct.
+        lat_int = round(lat * LAT_LON_SCALE)
+        lon_int = round(lon * LAT_LON_SCALE)
+
+        # The places_rtree virtual table stores REAL degree coordinates so we
+        # keep the rtree filter params in degrees (unchanged).
         sql = """
             SELECT p.*,
                    ((p.lat - ?) * (p.lat - ?) + (p.lon - ?) * (p.lon - ?)) AS dist_sq
@@ -424,7 +434,7 @@ def reverse(
             LIMIT ?
         """
         params = (
-            lat, lat, lon, lon,
+            lat_int, lat_int, lon_int, lon_int,
             max_lat, min_lat,
             max_lon, min_lon,
             limit,
@@ -436,7 +446,8 @@ def reverse(
         for row in rows:
             place = _format_place(conn, row, languages, country_cache)
             dist_sq = row["dist_sq"]
-            place["distance_deg"] = math.sqrt(dist_sq) if dist_sq >= 0 else 0.0
+            # dist_sq is in (LAT_LON_SCALE × degree)² units; sqrt then rescale.
+            place["distance_deg"] = math.sqrt(dist_sq) / LAT_LON_SCALE if dist_sq >= 0 else 0.0
             results.append(place)
         return results
     finally:

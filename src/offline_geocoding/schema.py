@@ -47,6 +47,18 @@ from typing import Any, List
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Storage scale constants
+# ---------------------------------------------------------------------------
+
+#: lat/lon is stored as ``round(degrees * LAT_LON_SCALE)`` (INTEGER).
+#: 1 000 000 gives ~0.11 m precision at the equator.
+LAT_LON_SCALE: int = 1_000_000
+
+#: importance is stored as ``round(value * IMPORTANCE_SCALE)`` (INTEGER).
+#: 2 decimal digits are sufficient for scoring.
+IMPORTANCE_SCALE: int = 100
+
+# ---------------------------------------------------------------------------
 # Schema DDL – shared between final and worker databases
 # ---------------------------------------------------------------------------
 
@@ -109,6 +121,8 @@ CREATE TABLE IF NOT EXISTS categories (
 -- ``country_code`` references countries(code) directly – no integer FK
 -- indirection – so the merge step does not need to remap country IDs.
 -- ``extra`` is a gzip-compressed JSON blob of arbitrary extra OSM tags.
+-- ``importance`` is stored as round(value * IMPORTANCE_SCALE) (INTEGER).
+-- ``lat`` / ``lon`` are stored as round(degrees * LAT_LON_SCALE) (INTEGER).
 CREATE TABLE IF NOT EXISTS places (
     id           INTEGER PRIMARY KEY,
     photon_id    TEXT,
@@ -117,12 +131,12 @@ CREATE TABLE IF NOT EXISTS places (
     osm_key      TEXT,
     osm_value    TEXT,
     address_type TEXT,
-    importance   REAL    NOT NULL DEFAULT 0.0,
+    importance   INTEGER NOT NULL DEFAULT 0,
     country_code TEXT    REFERENCES countries(code),
     postcode     TEXT,
     housenumber  TEXT,
-    lat          REAL    NOT NULL,
-    lon          REAL    NOT NULL,
+    lat          INTEGER NOT NULL,
+    lon          INTEGER NOT NULL,
     bbox_min_lon REAL,
     bbox_min_lat REAL,
     bbox_max_lon REAL,
@@ -172,12 +186,14 @@ CREATE TABLE IF NOT EXISTS fts_data (
 );
 
 -- Staging table for R-tree data; same lifecycle as fts_data.
+-- Coordinates stored as round(degrees * LAT_LON_SCALE) to save space;
+-- converted back to REAL when inserted into the places_rtree virtual table.
 CREATE TABLE IF NOT EXISTS rtree_data (
     id      INTEGER PRIMARY KEY,
-    min_lat REAL NOT NULL,
-    max_lat REAL NOT NULL,
-    min_lon REAL NOT NULL,
-    max_lon REAL NOT NULL
+    min_lat INTEGER NOT NULL,
+    max_lat INTEGER NOT NULL,
+    min_lon INTEGER NOT NULL,
+    max_lon INTEGER NOT NULL
 );
 """
 
@@ -228,25 +244,46 @@ def _check_sqlite_version() -> None:
         )
 
 
-def create_database(path: str) -> sqlite3.Connection:
+def create_database(path: str, with_indexes: bool = True) -> sqlite3.Connection:
     """Create (or open) the **final** geocoding database and apply its schema.
 
     The final database has FTS5 and R-tree virtual tables in addition to all
     common tables.
 
+    Parameters
+    ----------
+    path:
+        Filesystem path for the SQLite file.
+    with_indexes:
+        When ``True`` (default) the secondary B-tree indexes are created
+        immediately.  Pass ``False`` to defer index creation to the end of the
+        import (via :func:`create_indexes`) for faster bulk-insert performance.
+
     Returns an open :class:`sqlite3.Connection`.
     """
     _check_sqlite_version()
-    conn = sqlite3.connect(path, check_same_thread=False)
+    conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
     conn.row_factory = sqlite3.Row
     _apply_pragma(conn)
 
-    for block in (_COMMON_TABLES, _FTS, _RTREE, _INDEXES):
+    for block in (_COMMON_TABLES, _FTS, _RTREE):
         for stmt in _split_statements(block):
             conn.execute(stmt)
 
-    conn.commit()
+    if with_indexes:
+        create_indexes(conn)
+
     return conn
+
+
+def create_indexes(conn: sqlite3.Connection) -> None:
+    """Create (or ensure existence of) all secondary B-tree indexes.
+
+    Safe to call multiple times – every statement uses ``IF NOT EXISTS``.
+    Commit the connection after calling this function if needed.
+    """
+    for stmt in _split_statements(_INDEXES):
+        conn.execute(stmt)
 
 
 def create_worker_database(path: str) -> sqlite3.Connection:
@@ -263,7 +300,7 @@ def create_worker_database(path: str) -> sqlite3.Connection:
 
     Returns an open :class:`sqlite3.Connection`.
     """
-    conn = sqlite3.connect(path, check_same_thread=False)
+    conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
     conn.row_factory = sqlite3.Row
     for stmt in _split_statements(_WORKER_PRAGMA):
         conn.execute(stmt)
@@ -272,7 +309,6 @@ def create_worker_database(path: str) -> sqlite3.Connection:
         for stmt in _split_statements(block):
             conn.execute(stmt)
 
-    conn.commit()
     return conn
 
 

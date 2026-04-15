@@ -156,6 +156,17 @@ def main() -> None:
     help="Number of JSON lines per worker task.",
 )
 @click.option("--verbose", "-v", is_flag=True, help="Enable debug logging.")
+@click.option(
+    "--single-thread", "single_thread",
+    is_flag=True,
+    default=False,
+    help=(
+        "Run the import on a single thread without worker sub-processes. "
+        "Simpler, avoids the merge step, and defers index creation to the end "
+        "for faster bulk-insert performance.  Recommended when you have few CPUs "
+        "or want predictable, reproducible behaviour."
+    ),
+)
 def cmd_import(
     input_path: str,
     output_path: str,
@@ -164,6 +175,7 @@ def cmd_import(
     workers: int,
     batch_size: int,
     verbose: bool,
+    single_thread: bool,
 ) -> None:
     """Import a Photon JSONL(.zst) dump into a geocoding SQLite database."""
     _setup_logging(verbose)
@@ -185,6 +197,7 @@ def cmd_import(
         num_workers=workers,
         batch_size=batch_size,
         show_progress=True,
+        single_thread=single_thread,
     )
     click.echo("Done.")
 

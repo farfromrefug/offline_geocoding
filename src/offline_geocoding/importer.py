@@ -80,7 +80,14 @@ except ImportError:  # pragma: no cover
     tqdm = None  # type: ignore[assignment]
 
 from .poly_filter import PolyFilter
-from .schema import compress_json, create_database, create_worker_database
+from .schema import (
+    LAT_LON_SCALE,
+    IMPORTANCE_SCALE,
+    compress_json,
+    create_database,
+    create_indexes,
+    create_worker_database,
+)
 
 log = logging.getLogger(__name__)
 
@@ -463,6 +470,7 @@ def _write_places_batch(
     strings: _LocalStringCache,
     cats: _LocalCategoryCache,
     photon_to_db: Dict[str, Tuple[int, Optional[str], Optional[str]]],
+    staging: bool = True,
 ) -> None:
     """Bulk-write a list of already-parsed places into the worker database.
 
@@ -474,6 +482,14 @@ def _write_places_batch(
     3. Insert all place rows with one ``executemany``.
     4. Build and insert place_names / place_addresses / place_categories /
        fts_data / rtree_data rows with one ``executemany`` each.
+
+    Parameters
+    ----------
+    staging:
+        ``True`` (default) writes FTS/rtree data to the intermediate staging
+        tables ``fts_data`` / ``rtree_data`` (used in worker databases).
+        ``False`` writes directly to the virtual tables ``places_fts`` and
+        ``places_rtree`` (used in single-thread / direct-to-final mode).
     """
     if not parsed_places:
         return
@@ -544,12 +560,14 @@ def _write_places_batch(
             place["osm_key"],
             place["osm_value"],
             place["address_type"],
-            place["importance"],
+            # importance stored as INTEGER (×IMPORTANCE_SCALE, 2 decimals max).
+            round(place["importance"] * IMPORTANCE_SCALE),
             place["country_code"],
             place["postcode"],
             place["housenumber"],
-            place["lat"],
-            place["lon"],
+            # lat/lon stored as INTEGER (×LAT_LON_SCALE, ~0.11m precision).
+            round(place["lat"] * LAT_LON_SCALE),
+            round(place["lon"] * LAT_LON_SCALE),
             place["bbox_min_lon"],
             place["bbox_min_lat"],
             place["bbox_max_lon"],
@@ -615,10 +633,12 @@ def _write_places_batch(
 
         rtree_rows.append((
             pid,
-            place["bbox_min_lat"],
-            place["bbox_max_lat"],
-            place["bbox_min_lon"],
-            place["bbox_max_lon"],
+            # R-tree bbox stored as INTEGER (×LAT_LON_SCALE) in staging table;
+            # converted back to REAL when inserted into the virtual table.
+            round(place["bbox_min_lat"] * LAT_LON_SCALE),
+            round(place["bbox_max_lat"] * LAT_LON_SCALE),
+            round(place["bbox_min_lon"] * LAT_LON_SCALE),
+            round(place["bbox_max_lon"] * LAT_LON_SCALE),
         ))
 
     if name_rows:
@@ -640,16 +660,34 @@ def _write_places_batch(
             cat_rows,
         )
     if fts_rows:
-        conn.executemany(
-            "INSERT OR REPLACE INTO fts_data(place_id, names, address) VALUES (?,?,?)",
-            fts_rows,
-        )
+        if staging:
+            conn.executemany(
+                "INSERT OR REPLACE INTO fts_data(place_id, names, address) VALUES (?,?,?)",
+                fts_rows,
+            )
+        else:
+            conn.executemany(
+                "INSERT INTO places_fts(place_id, names, address) VALUES (?,?,?)",
+                fts_rows,
+            )
     if rtree_rows:
-        conn.executemany(
-            "INSERT OR REPLACE INTO rtree_data"
-            "(id, min_lat, max_lat, min_lon, max_lon) VALUES (?,?,?,?,?)",
-            rtree_rows,
-        )
+        if staging:
+            conn.executemany(
+                "INSERT OR REPLACE INTO rtree_data"
+                "(id, min_lat, max_lat, min_lon, max_lon) VALUES (?,?,?,?,?)",
+                rtree_rows,
+            )
+        else:
+            # Convert from scaled integers back to REAL degrees for the virtual table.
+            scale = float(LAT_LON_SCALE)
+            conn.executemany(
+                "INSERT INTO places_rtree(id, min_lat, max_lat, min_lon, max_lon)"
+                " VALUES (?,?,?,?,?)",
+                [
+                    (r[0], r[1] / scale, r[2] / scale, r[3] / scale, r[4] / scale)
+                    for r in rtree_rows
+                ],
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -766,10 +804,10 @@ def _worker_main(
 
         # Periodic commit to bound transaction size.
         if local_counter % _COMMIT_EVERY == 0 and local_counter > 0:
-            conn.commit()
+            conn.execute("COMMIT")
             conn.execute("BEGIN")
 
-    conn.commit()
+    conn.execute("COMMIT")
     conn.close()
     log.debug("Worker %d done: %d places", worker_id, local_counter)
 
@@ -795,190 +833,218 @@ def _merge_worker_db(
 
     Returns the number of places merged from this worker.
     """
+    final_conn.execute("PRAGMA foreign_keys = OFF")
     final_conn.execute("ATTACH DATABASE ? AS w", (worker_path,))
-    final_conn.execute("BEGIN")
+    try:
+        final_conn.execute("BEGIN")
 
-    # 1. Strings - INSERT OR IGNORE deduplicates by value.
-    final_conn.execute(
-        "INSERT OR IGNORE INTO strings(value) SELECT value FROM w.strings"
-    )
-
-    # 2. String ID mapping: worker local id -> final global id (join by value).
-    final_conn.execute(
-        "CREATE TEMP TABLE IF NOT EXISTS _smap(wid INTEGER, fid INTEGER)"
-    )
-    final_conn.execute("DELETE FROM _smap")
-    final_conn.execute(
-        """
-        INSERT INTO _smap(wid, fid)
-        SELECT ws.id, ms.id
-        FROM w.strings ws
-        JOIN main.strings ms ON ms.value = ws.value
-        """
-    )
-
-    # 3. Categories - same pattern.
-    final_conn.execute(
-        "INSERT OR IGNORE INTO categories(name) SELECT name FROM w.categories"
-    )
-    final_conn.execute(
-        "CREATE TEMP TABLE IF NOT EXISTS _cmap(wid INTEGER, fid INTEGER)"
-    )
-    final_conn.execute("DELETE FROM _cmap")
-    final_conn.execute(
-        """
-        INSERT INTO _cmap(wid, fid)
-        SELECT wc.id, mc.id
-        FROM w.categories wc
-        JOIN main.categories mc ON mc.name = wc.name
-        """
-    )
-
-    # 4. Countries - upsert by TEXT primary key (code); no integer remap needed.
-    #    SQLite's new-style upsert (ON CONFLICT DO UPDATE) does not work with
-    #    INSERT...SELECT from an ATTACH'd database, so we use a two-step approach:
-    #    INSERT OR IGNORE to add new countries, then UPDATE to overwrite names
-    #    from the worker only when the worker has non-empty name data.
-    final_conn.execute(
-        "INSERT OR IGNORE INTO countries(code, names) SELECT code, names FROM w.countries"
-    )
-    final_conn.execute(
-        """
-        UPDATE countries
-        SET names = (
-            SELECT wc.names FROM w.countries wc WHERE wc.code = countries.code
+        # 1. Strings - INSERT OR IGNORE deduplicates by value.
+        final_conn.execute(
+            "INSERT OR IGNORE INTO strings(value) SELECT value FROM w.strings"
         )
-        WHERE code IN (SELECT code FROM w.countries WHERE names != X'')
-        """
-    )
 
-    # 5. Metadata - upsert (all workers write the same dump_version value).
-    final_conn.execute(
-        """
-        INSERT OR REPLACE INTO metadata(key, value)
-        SELECT key, value FROM w.metadata
-        """
-    )
-
-    # 6. Ensure all country_codes referenced by the worker's places exist in
-    #    the final countries table BEFORE inserting the places.  This handles
-    #    the case where a worker's batch never contained a CountryInfo record
-    #    for a country referenced by its places.
-    final_conn.execute(
-        """
-        INSERT OR IGNORE INTO countries(code, names)
-        SELECT DISTINCT country_code, X''
-        FROM w.places
-        WHERE country_code IS NOT NULL
-        """
-    )
-
-    # 7. Places - insert without explicit id so SQLite assigns new sequential IDs.
-    #    We capture the current max id before insertion to build the mapping.
-    base_row = final_conn.execute(
-        "SELECT COALESCE(MAX(id), 0) FROM places"
-    ).fetchone()
-    base_id: int = base_row[0]
-
-    worker_count_row = final_conn.execute(
-        "SELECT COUNT(*) FROM w.places"
-    ).fetchone()
-    worker_place_count: int = worker_count_row[0]
-
-    if worker_place_count > 0:
+        # 2. String ID mapping: worker local id -> final global id (join by value).
+        final_conn.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS _smap(wid INTEGER, fid INTEGER)"
+        )
+        final_conn.execute("DELETE FROM _smap")
         final_conn.execute(
             """
-            INSERT INTO places(
-                photon_id, osm_type, osm_id, osm_key, osm_value,
-                address_type, importance, country_code, postcode, housenumber,
-                lat, lon, bbox_min_lon, bbox_min_lat, bbox_max_lon, bbox_max_lat,
-                extra
+            INSERT INTO _smap(wid, fid)
+            SELECT ws.id, ms.id
+            FROM w.strings ws
+            JOIN main.strings ms ON ms.value = ws.value
+            """
+        )
+        final_conn.execute(
+            "CREATE INDEX IF NOT EXISTS _idx_smap_wid ON _smap(wid)"
+        )
+
+        # 3. Categories - same pattern.
+        final_conn.execute(
+            "INSERT OR IGNORE INTO categories(name) SELECT name FROM w.categories"
+        )
+        final_conn.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS _cmap(wid INTEGER, fid INTEGER)"
+        )
+        final_conn.execute("DELETE FROM _cmap")
+        final_conn.execute(
+            """
+            INSERT INTO _cmap(wid, fid)
+            SELECT wc.id, mc.id
+            FROM w.categories wc
+            JOIN main.categories mc ON mc.name = wc.name
+            """
+        )
+        final_conn.execute(
+            "CREATE INDEX IF NOT EXISTS _idx_cmap_wid ON _cmap(wid)"
+        )
+
+        # 4. Countries - upsert by TEXT primary key (code); no integer remap needed.
+        #    SQLite's new-style upsert (ON CONFLICT DO UPDATE) does not work with
+        #    INSERT...SELECT from an ATTACH'd database, so we use a two-step approach:
+        #    INSERT OR IGNORE to add new countries, then UPDATE to overwrite names
+        #    from the worker only when the worker has non-empty name data.
+        final_conn.execute(
+            "INSERT OR IGNORE INTO countries(code, names) SELECT code, names FROM w.countries"
+        )
+        final_conn.execute(
+            """
+            UPDATE countries
+            SET names = (
+                SELECT wc.names FROM w.countries wc WHERE wc.code = countries.code
             )
-            SELECT
-                photon_id, osm_type, osm_id, osm_key, osm_value,
-                address_type, importance, country_code, postcode, housenumber,
-                lat, lon, bbox_min_lon, bbox_min_lat, bbox_max_lon, bbox_max_lat,
-                extra
+            WHERE code IN (SELECT code FROM w.countries WHERE names != X'')
+            """
+        )
+
+        # 5. Metadata - upsert (all workers write the same dump_version value).
+        final_conn.execute(
+            """
+            INSERT OR REPLACE INTO metadata(key, value)
+            SELECT key, value FROM w.metadata
+            """
+        )
+
+        # 6. Ensure all country_codes referenced by the worker's places exist in
+        #    the final countries table BEFORE inserting the places.  This handles
+        #    the case where a worker's batch never contained a CountryInfo record
+        #    for a country referenced by its places.
+        final_conn.execute(
+            """
+            INSERT OR IGNORE INTO countries(code, names)
+            SELECT DISTINCT country_code, X''
             FROM w.places
-            ORDER BY id
+            WHERE country_code IS NOT NULL
             """
         )
 
-        # 8. Place ID mapping using ROW_NUMBER.
-        #    Rows were inserted in w.places ORDER BY id, so the k-th inserted
-        #    row (1-based) got id = base_id + k.
-        final_conn.execute(
-            "CREATE TEMP TABLE IF NOT EXISTS _pmap(wid INTEGER, fid INTEGER)"
-        )
-        final_conn.execute("DELETE FROM _pmap")
-        final_conn.execute(
-            f"""
-            WITH src AS (
-                SELECT id AS wid,
-                       ROW_NUMBER() OVER (ORDER BY id) AS rn
+        # 7. Places - insert without explicit id so SQLite assigns new sequential IDs.
+        #    We capture the current max id before insertion to build the mapping.
+        base_row = final_conn.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM places"
+        ).fetchone()
+        base_id: int = base_row[0]
+
+        worker_count_row = final_conn.execute(
+            "SELECT COUNT(*) FROM w.places"
+        ).fetchone()
+        worker_place_count: int = worker_count_row[0]
+
+        if worker_place_count > 0:
+            final_conn.execute(
+                """
+                INSERT INTO places(
+                    photon_id, osm_type, osm_id, osm_key, osm_value,
+                    address_type, importance, country_code, postcode, housenumber,
+                    lat, lon, bbox_min_lon, bbox_min_lat, bbox_max_lon, bbox_max_lat,
+                    extra
+                )
+                SELECT
+                    photon_id, osm_type, osm_id, osm_key, osm_value,
+                    address_type, importance, country_code, postcode, housenumber,
+                    lat, lon, bbox_min_lon, bbox_min_lat, bbox_max_lon, bbox_max_lat,
+                    extra
                 FROM w.places
+                ORDER BY id
+                """
             )
-            INSERT INTO _pmap(wid, fid)
-            SELECT src.wid, {base_id} + src.rn
-            FROM src
-            """
-        )
 
-        # 9. place_names - remap place_id and string_id.
-        final_conn.execute(
-            """
-            INSERT OR IGNORE INTO place_names(place_id, string_id, lang, kind)
-            SELECT pm.fid, sm.fid, pn.lang, pn.kind
-            FROM w.place_names pn
-            JOIN _pmap pm ON pm.wid = pn.place_id
-            JOIN _smap sm ON sm.wid = pn.string_id
-            """
-        )
+            # 8. Place ID mapping using ROW_NUMBER.
+            #    Rows were inserted in w.places ORDER BY id, so the k-th inserted
+            #    row (1-based) got id = base_id + k.
+            final_conn.execute(
+                "CREATE TEMP TABLE IF NOT EXISTS _pmap(wid INTEGER, fid INTEGER)"
+            )
+            final_conn.execute("DELETE FROM _pmap")
+            final_conn.execute(
+                f"""
+                WITH src AS (
+                    SELECT id AS wid,
+                           ROW_NUMBER() OVER (ORDER BY id) AS rn
+                    FROM w.places
+                )
+                INSERT INTO _pmap(wid, fid)
+                SELECT src.wid, {base_id} + src.rn
+                FROM src
+                """
+            )
+            final_conn.execute(
+                "CREATE INDEX IF NOT EXISTS _idx_pmap_wid ON _pmap(wid)"
+            )
 
-        # 10. place_addresses - remap place_id and string_id.
-        final_conn.execute(
-            """
-            INSERT OR IGNORE INTO place_addresses(place_id, string_id, addr_type, lang)
-            SELECT pm.fid, sm.fid, pa.addr_type, pa.lang
-            FROM w.place_addresses pa
-            JOIN _pmap pm ON pm.wid = pa.place_id
-            JOIN _smap sm ON sm.wid = pa.string_id
-            """
-        )
+            # 9. place_names - remap place_id and string_id.
+            final_conn.execute(
+                """
+                INSERT OR IGNORE INTO place_names(place_id, string_id, lang, kind)
+                SELECT pm.fid, sm.fid, pn.lang, pn.kind
+                FROM w.place_names pn
+                JOIN _pmap pm ON pm.wid = pn.place_id
+                JOIN _smap sm ON sm.wid = pn.string_id
+                """
+            )
 
-        # 11. place_categories - remap place_id and category_id.
-        final_conn.execute(
-            """
-            INSERT OR IGNORE INTO place_categories(place_id, category_id)
-            SELECT pm.fid, cm.fid
-            FROM w.place_categories pc
-            JOIN _pmap pm ON pm.wid = pc.place_id
-            JOIN _cmap cm ON cm.wid = pc.category_id
-            """
-        )
+            # 10. place_addresses - remap place_id and string_id.
+            final_conn.execute(
+                """
+                INSERT OR IGNORE INTO place_addresses(place_id, string_id, addr_type, lang)
+                SELECT pm.fid, sm.fid, pa.addr_type, pa.lang
+                FROM w.place_addresses pa
+                JOIN _pmap pm ON pm.wid = pa.place_id
+                JOIN _smap sm ON sm.wid = pa.string_id
+                """
+            )
 
-        # 12. FTS5 - remap place_id; insert into virtual table.
-        final_conn.execute(
-            """
-            INSERT INTO places_fts(place_id, names, address)
-            SELECT pm.fid, fd.names, fd.address
-            FROM w.fts_data fd
-            JOIN _pmap pm ON pm.wid = fd.place_id
-            """
-        )
+            # 11. place_categories - remap place_id and category_id.
+            final_conn.execute(
+                """
+                INSERT OR IGNORE INTO place_categories(place_id, category_id)
+                SELECT pm.fid, cm.fid
+                FROM w.place_categories pc
+                JOIN _pmap pm ON pm.wid = pc.place_id
+                JOIN _cmap cm ON cm.wid = pc.category_id
+                """
+            )
 
-        # 13. R-tree - remap id.
-        final_conn.execute(
-            """
-            INSERT INTO places_rtree(id, min_lat, max_lat, min_lon, max_lon)
-            SELECT pm.fid, rd.min_lat, rd.max_lat, rd.min_lon, rd.max_lon
-            FROM w.rtree_data rd
-            JOIN _pmap pm ON pm.wid = rd.id
-            """
-        )
+            # 12. FTS5 - remap place_id; insert into virtual table.
+            final_conn.execute(
+                """
+                INSERT INTO places_fts(place_id, names, address)
+                SELECT pm.fid, fd.names, fd.address
+                FROM w.fts_data fd
+                JOIN _pmap pm ON pm.wid = fd.place_id
+                """
+            )
 
-    final_conn.commit()
-    final_conn.execute("DETACH DATABASE w")
+            # 13. R-tree - remap id; convert INTEGER coords to REAL degrees.
+            final_conn.execute(
+                f"""
+                INSERT INTO places_rtree(id, min_lat, max_lat, min_lon, max_lon)
+                SELECT pm.fid,
+                       rd.min_lat * 1.0 / {LAT_LON_SCALE},
+                       rd.max_lat * 1.0 / {LAT_LON_SCALE},
+                       rd.min_lon * 1.0 / {LAT_LON_SCALE},
+                       rd.max_lon * 1.0 / {LAT_LON_SCALE}
+                FROM w.rtree_data rd
+                JOIN _pmap pm ON pm.wid = rd.id
+                """
+            )
+
+        final_conn.execute("COMMIT")
+
+    except Exception:
+        try:
+            final_conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+
+    finally:
+        try:
+            final_conn.execute("DETACH DATABASE w")
+        except Exception:
+            pass
+        final_conn.execute("PRAGMA foreign_keys = ON")
 
     return worker_place_count
 
@@ -1021,6 +1087,163 @@ def _line_batches(
 
 
 # ---------------------------------------------------------------------------
+# Single-threaded import (no worker sub-processes, no merge)
+# ---------------------------------------------------------------------------
+
+def _import_single_thread(
+    input_path: str,
+    output_path: str,
+    languages: List[str],
+    poly_file: Optional[str],
+    batch_size: int,
+    show_progress: bool,
+) -> None:
+    """Import directly into the final database on a single thread.
+
+    Advantages over the parallel mode:
+    * No sub-process overhead or inter-process communication.
+    * No temporary worker databases → no merge step.
+    * Secondary indexes are deferred until after all data is loaded, which
+      is significantly faster for large imports.
+
+    Trade-off: only one CPU core is used.
+    """
+    poly_filter: Optional[PolyFilter] = None
+    if poly_file:
+        pf = PolyFilter.from_file(poly_file)
+        poly_filter = pf
+        log.info(
+            "Loaded poly filter from %s (%d polygon(s))",
+            poly_file,
+            len(pf.__getstate__()),
+        )
+
+    lang_set: Set[str] = set(languages)
+
+    if os.path.exists(output_path):
+        os.unlink(output_path)
+
+    # Create final DB without secondary indexes – they are created at the end
+    # for much faster bulk-insert performance.
+    conn = create_database(output_path, with_indexes=False)
+
+    conn.execute("BEGIN")
+    conn.execute(
+        "INSERT OR REPLACE INTO metadata(key, value) VALUES (?,?)",
+        ("languages", json.dumps(languages)),
+    )
+    conn.execute("COMMIT")
+
+    strings = _LocalStringCache(conn)
+    cats = _LocalCategoryCache(conn)
+    photon_to_db: Dict[str, Tuple[int, Optional[str], Optional[str]]] = {}
+    total_places = 0
+
+    conn.execute("BEGIN")
+
+    pbar = None
+    if show_progress and tqdm is not None:
+        pbar = tqdm(unit=" batches", desc="Reading+parsing", dynamic_ncols=True)
+
+    text_iter, raw_fh = _open_input(input_path)
+    try:
+        for batch in _line_batches(text_iter, batch_size):
+            batch_country_infos: List[List[Dict]] = []
+            parsed_places: List[Dict] = []
+
+            for raw_line in batch:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+
+                obj_type = obj.get("type")
+                content = obj.get("content")
+
+                if obj_type == "NominatimDumpFile":
+                    if isinstance(content, dict):
+                        conn.execute(
+                            "INSERT OR REPLACE INTO metadata(key, value) VALUES (?,?)",
+                            ("dump_version", content.get("version", "")),
+                        )
+
+                elif obj_type == "CountryInfo":
+                    if isinstance(content, list):
+                        batch_country_infos.append(content)
+
+                elif obj_type == "Place":
+                    if not isinstance(content, list):
+                        continue
+                    for entry in content:
+                        if not isinstance(entry, dict):
+                            continue
+                        parsed = _parse_place_entry(entry, lang_set, poly_filter)
+                        if parsed is None:
+                            continue
+                        total_places += 1
+                        parsed["_place_id"] = total_places
+                        parsed_places.append(parsed)
+
+            # Countries first so foreign key references resolve (FK=ON in final DB).
+            for country_list in batch_country_infos:
+                _write_countries_worker(conn, country_list, lang_set)
+
+            # Write directly into the final DB virtual tables (staging=False).
+            if parsed_places:
+                try:
+                    _write_places_batch(
+                        conn, parsed_places, strings, cats, photon_to_db,
+                        staging=False,
+                    )
+                except sqlite3.Error as exc:
+                    log.warning("Batch write failed: %s", exc)
+                    for place in parsed_places:
+                        try:
+                            _write_places_batch(
+                                conn, [place], strings, cats, photon_to_db,
+                                staging=False,
+                            )
+                        except sqlite3.Error as exc2:
+                            log.debug(
+                                "Skipping place %s: %s",
+                                place.get("photon_id"), exc2,
+                            )
+
+            if pbar is not None:
+                pbar.update(1)
+
+            if total_places % _COMMIT_EVERY == 0 and total_places > 0:
+                conn.execute("COMMIT")
+                conn.execute("BEGIN")
+
+    finally:
+        if pbar is not None:
+            pbar.close()
+        try:
+            text_iter.close()
+        except Exception:
+            pass
+        try:
+            raw_fh.close()
+        except Exception:
+            pass
+
+    conn.execute("COMMIT")
+
+    log.info("Creating indexes...")
+    create_indexes(conn)
+
+    log.info("Running ANALYZE...")
+    conn.execute("ANALYZE")
+    conn.close()
+
+    log.info("Import complete (single-thread): %d places imported.", total_places)
+
+
+# ---------------------------------------------------------------------------
 # Public import entry point
 # ---------------------------------------------------------------------------
 
@@ -1032,6 +1255,7 @@ def import_database(
     num_workers: int = 0,
     batch_size: int = _DEFAULT_BATCH,
     show_progress: bool = True,
+    single_thread: bool = False,
 ) -> None:
     """Import a Photon JSONL(.zst) dump into *output_path*.
 
@@ -1048,13 +1272,33 @@ def import_database(
         Optional path to a ``.poly`` filter file.
     num_workers:
         Number of worker processes.  ``0`` uses all available CPUs.
+        Ignored when *single_thread* is ``True``.
     batch_size:
         Number of JSON lines per work-queue item.
     show_progress:
         Display a ``tqdm`` progress bar when *tqdm* is installed.
+    single_thread:
+        When ``True``, run the entire import on the calling thread without
+        spawning worker sub-processes.  No temporary databases are created
+        and no merge step is needed.  Secondary indexes are deferred to the
+        end of the import for faster bulk-insert performance.  Recommended
+        when simplicity or deterministic behaviour matters more than
+        maximum CPU utilisation.
     """
     if not languages:
         raise ValueError("At least one language must be specified.")
+
+    if single_thread:
+        log.info("Single-thread mode: running import without worker processes.")
+        _import_single_thread(
+            input_path=input_path,
+            output_path=output_path,
+            languages=languages,
+            poly_file=poly_file,
+            batch_size=batch_size,
+            show_progress=show_progress,
+        )
+        return
 
     n_workers = num_workers if num_workers > 0 else max(1, (mp.cpu_count() or 1))
     log.info("Using %d worker process(es)", n_workers)
@@ -1144,11 +1388,12 @@ def import_database(
     final_conn = create_database(output_path)
 
     # Store language metadata in the final database.
+    final_conn.execute("BEGIN")
     final_conn.execute(
         "INSERT OR REPLACE INTO metadata(key, value) VALUES (?,?)",
         ("languages", json.dumps(languages)),
     )
-    final_conn.commit()
+    final_conn.execute("COMMIT")
 
     total_places = 0
     for i, worker_path in enumerate(worker_db_paths):

@@ -475,6 +475,71 @@ def test_import_place_without_country_info(tmp_path):
     conn.close()
 
 
+def test_import_single_thread_mode(tmp_path):
+    """Single-thread import produces the same results as parallel import."""
+    jsonl_path = _write_jsonl(tmp_path, [PARIS_ENTRY, EIFFEL_ENTRY])
+    db_path = str(tmp_path / "geo_single.db")
+
+    import_database(
+        input_path=jsonl_path,
+        output_path=db_path,
+        languages=["en", "fr"],
+        single_thread=True,
+        show_progress=False,
+    )
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+
+    assert conn.execute("SELECT COUNT(*) FROM places").fetchone()[0] == 2
+    assert conn.execute("SELECT COUNT(*) FROM places_fts").fetchone()[0] == 2
+    assert conn.execute("SELECT COUNT(*) FROM places_rtree").fetchone()[0] == 2
+
+    # lat/lon stored as INTEGER (×1_000_000); verify the stored type.
+    row = conn.execute("SELECT lat, lon, importance FROM places LIMIT 1").fetchone()
+    assert isinstance(row["lat"], int), "lat should be stored as INTEGER"
+    assert isinstance(row["lon"], int), "lon should be stored as INTEGER"
+    assert isinstance(row["importance"], int), "importance should be stored as INTEGER"
+
+    # Country should be recorded.
+    assert conn.execute(
+        "SELECT COUNT(*) FROM countries WHERE code = 'fr'"
+    ).fetchone()[0] == 1
+
+    conn.close()
+
+
+def test_schema_integer_lat_lon_importance(tmp_path):
+    """lat/lon are stored as scaled integers; importance as scaled integer."""
+    from offline_geocoding.schema import LAT_LON_SCALE, IMPORTANCE_SCALE
+
+    jsonl_path = _write_jsonl(tmp_path, [PARIS_ENTRY])
+    db_path = str(tmp_path / "geo_schema.db")
+
+    import_database(
+        input_path=jsonl_path,
+        output_path=db_path,
+        languages=["en"],
+        num_workers=1,
+        show_progress=False,
+    )
+
+    conn = sqlite3.connect(db_path)
+    row = conn.execute("SELECT lat, lon, importance FROM places LIMIT 1").fetchone()
+
+    # Verify storage types.
+    assert isinstance(row[0], int), "lat must be INTEGER"
+    assert isinstance(row[1], int), "lon must be INTEGER"
+    assert isinstance(row[2], int), "importance must be INTEGER"
+
+    # Verify values round-trip correctly.
+    assert abs(row[0] / LAT_LON_SCALE - 48.8566) < 1e-5
+    assert abs(row[1] / LAT_LON_SCALE - 2.3522) < 1e-5
+    assert abs(row[2] / IMPORTANCE_SCALE - 0.8) < 1e-3
+
+    conn.close()
+
+
 def test_import_country_names_language(tmp_path):
     """Country names are stored in the countries table with language keys."""
     jsonl_path = _write_jsonl(tmp_path, [PARIS_ENTRY])
