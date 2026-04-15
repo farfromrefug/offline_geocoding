@@ -346,6 +346,8 @@ class _StringCache:
                 "INSERT OR IGNORE INTO strings(value) VALUES (?)",
                 [(v,) for v in missing],
             )
+            # SQLite's default SQLITE_LIMIT_VARIABLE_NUMBER is 999; stay
+            # safely below it so we can pass N values in a single query.
             chunk = 900
             for i in range(0, len(missing), chunk):
                 part = missing[i: i + chunk]

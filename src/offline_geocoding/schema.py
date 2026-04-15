@@ -18,7 +18,7 @@ import gzip
 import json
 import logging
 import sqlite3
-from typing import Any
+from typing import Any, List
 
 log = logging.getLogger(__name__)
 
@@ -202,7 +202,7 @@ def _split_statements(sql: str):
     Splits on ``;`` that appear outside of SQL single-line comments
     (``-- …``), block comments (``/* … */``), and quoted string literals.
     """
-    stmt_chars: list[str] = []
+    stmt_chars: List[str] = []
     i = 0
     n = len(sql)
 

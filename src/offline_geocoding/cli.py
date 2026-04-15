@@ -10,16 +10,16 @@ stats    – Show database statistics.
 Examples
 --------
 # Build a database for English + French, filtered to a .poly region:
-    offline-geocoding import \\
-        --input  /data/photon-dump.jsonl.zst \\
-        --output /data/geocoding.db \\
-        --languages en,fr \\
-        --poly    /data/europe.poly \\
+    offline-geocoding import \
+        --input  /data/photon-dump.jsonl.zst \
+        --output /data/geocoding.db \
+        --languages en,fr \
+        --poly    /data/europe.poly \
         --workers 8
 
 # Search:
     offline-geocoding search --db /data/geocoding.db "Eiffel Tower"
-    offline-geocoding search --db /data/geocoding.db "Paris" \\
+    offline-geocoding search --db /data/geocoding.db "Paris" \
         --bbox 2.0,48.5,3.0,49.2 --limit 5
 
 # Reverse geocoding:
