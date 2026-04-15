@@ -59,6 +59,18 @@ PRAGMA mmap_size    = 268435456;
 PRAGMA foreign_keys = ON;
 """
 
+# Worker databases are disposable: use synchronous=OFF (safe – if the process
+# crashes the whole file is discarded) and foreign_keys=OFF (constraint checking
+# is pure overhead when the DB is rebuilt from scratch every import run).
+_WORKER_PRAGMA = """
+PRAGMA journal_mode = WAL;
+PRAGMA synchronous  = OFF;
+PRAGMA temp_store   = MEMORY;
+PRAGMA cache_size   = -131072;
+PRAGMA mmap_size    = 268435456;
+PRAGMA foreign_keys = OFF;
+"""
+
 # Tables present in BOTH the final database and every worker database.
 _COMMON_TABLES = """
 CREATE TABLE IF NOT EXISTS metadata (
@@ -245,11 +257,16 @@ def create_worker_database(path: str) -> sqlite3.Connection:
     tables.  This avoids virtual-table overhead during high-throughput writes
     and ensures that ATTACH-based merging works reliably.
 
+    ``PRAGMA foreign_keys = OFF`` is intentional: worker DBs are disposable and
+    constraint checking is pure overhead on the hot write path.  Integrity is
+    still guaranteed via the merge SQL which JOINs on mapping tables.
+
     Returns an open :class:`sqlite3.Connection`.
     """
     conn = sqlite3.connect(path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    _apply_pragma(conn)
+    for stmt in _split_statements(_WORKER_PRAGMA):
+        conn.execute(stmt)
 
     for block in (_COMMON_TABLES, _WORKER_PLAIN_TABLES):
         for stmt in _split_statements(block):

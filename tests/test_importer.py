@@ -436,6 +436,45 @@ def test_import_metadata(tmp_path):
     conn.close()
 
 
+def test_import_place_without_country_info(tmp_path):
+    """Places whose country_code is not covered by a CountryInfo record must
+    still be imported (no FK constraint failure).
+
+    This simulates the common multi-worker case where one worker receives a
+    Place batch referencing a country code that was never delivered in a
+    CountryInfo batch to that same worker.
+    """
+    # Build a dump with ONLY a Place (no CountryInfo), so the worker's
+    # countries table starts empty when the place is inserted.
+    lines = []
+    lines.append(json.dumps(PARIS_ENTRY))  # raw place entry (not wrapped)
+    # Wrap it properly as a Place message.
+    dump_bytes = (
+        json.dumps({"type": "Place", "content": [PARIS_ENTRY]}) + "\n"
+    ).encode("utf-8")
+    path = str(tmp_path / "no_country_info.jsonl")
+    Path(path).write_bytes(dump_bytes)
+
+    db_path = str(tmp_path / "geo_no_ci.db")
+    import_database(
+        input_path=path,
+        output_path=db_path,
+        languages=["en", "fr"],
+        num_workers=1,
+        show_progress=False,
+    )
+
+    conn = sqlite3.connect(db_path)
+    count = conn.execute("SELECT COUNT(*) FROM places").fetchone()[0]
+    assert count == 1, "Place with unknown country_code should still be imported"
+    # A placeholder country row should have been created.
+    cc = conn.execute(
+        "SELECT COUNT(*) FROM countries WHERE code = 'fr'"
+    ).fetchone()[0]
+    assert cc == 1, "Placeholder country row should be created for the country_code"
+    conn.close()
+
+
 def test_import_country_names_language(tmp_path):
     """Country names are stored in the countries table with language keys."""
     jsonl_path = _write_jsonl(tmp_path, [PARIS_ENTRY])

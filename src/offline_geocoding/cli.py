@@ -150,7 +150,7 @@ def main() -> None:
 )
 @click.option(
     "--batch-size", "-b",
-    default=500,
+    default=2000,
     show_default=True,
     type=int,
     help="Number of JSON lines per worker task.",

@@ -28,25 +28,35 @@ filtering are CPU-bound.  We therefore use a **producer–consumer** pattern:
      inserted using JOIN on those mapping tables – ensuring referential
      integrity and complete cross-worker deduplication.
 
-Name-tag handling
------------------
-Given ``--languages en,fr``:
+FK constraint and CountryInfo distribution
+------------------------------------------
+Workers consume batches from a shared queue.  Only one worker receives the
+``CountryInfo`` batch, so other workers start with an empty ``countries``
+table.  Two complementary measures prevent FK errors:
 
-* ``name``          -> lang ``'default'`` (OSM bare name, always kept)
-* ``name:en``       -> lang ``'en'``
-* ``name:fr``       -> lang ``'fr'``
-* ``alt_name``      -> lang ``'default'``, kind ``'alt'``
-* ``alt_name:en``   -> lang ``'en'``, kind ``'alt'``
-* Other language suffixes are dropped.
+* Worker databases use ``PRAGMA foreign_keys = OFF`` (disposable DBs).
+* ``_write_places_batch`` bulk-inserts placeholder country rows
+  ``(code, X'')`` for every country_code referenced by a batch before
+  inserting the places themselves.  The merge step later back-fills real
+  names from whichever worker received CountryInfo.
+* The merge step also bulk-inserts placeholder countries from the worker's
+  ``places`` table before inserting the places themselves, in case any
+  country_code was never seen by that worker's countries table.
 
-Address-tag handling mirrors the same pattern for all ``_ADDR_TYPES``.
+Batch write optimisation
+------------------------
+Within each batch the worker:
+1. Parses all JSON lines.
+2. Collects every unique string needed across all places in the batch and
+   interns them in one ``executemany`` + one ``SELECT … IN (…)`` per batch
+   (``intern_batch``) instead of N separate INSERT+SELECT pairs.
+3. Inserts all place rows with a single ``executemany``.
+4. Builds place_names / place_addresses / place_categories / fts_data /
+   rtree_data row lists for the whole batch, then inserts them with one
+   ``executemany`` each.
 
-Addresslines
-------------
-``addresslines`` references are resolved within each worker's accumulated
-state (``photon_to_db`` dict).  Cross-worker references are silently dropped
-– this is an acceptable limitation since most critical address data lives in
-the ``address`` field of each place entry.
+This reduces per-place SQL round trips from ~8 to ~0 (amortised over the
+batch size).
 """
 
 from __future__ import annotations
@@ -96,10 +106,12 @@ _ADDR_TYPES: Set[str] = {
 }
 
 # Default batch size (number of raw JSON lines per dispatch).
-_DEFAULT_BATCH = 500
+# Larger batches reduce queue overhead and amortise per-batch SQL setup.
+_DEFAULT_BATCH = 2_000
 
 # Number of places between transaction commits within a worker.
-_COMMIT_EVERY = 5_000
+# Larger value = fewer commits = faster writes (WAL mode makes this safe).
+_COMMIT_EVERY = 50_000
 
 # Sentinel value put on the work queue to tell a worker to shut down.
 _SENTINEL = None
@@ -107,6 +119,10 @@ _SENTINEL = None
 # Each worker is allocated this many consecutive place IDs.
 # 50 million per worker -> supports up to 127 workers (63-bit SQLite INTEGER).
 _PLACES_PER_WORKER = 50_000_000
+
+# Maximum number of parameters in a single SQLite statement (SQLITE_MAX_VARIABLE_NUMBER).
+# We stay safely below the hard limit of 999 / 32766 depending on build.
+_SQL_PARAM_CHUNK = 900
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +333,7 @@ class _LocalStringCache:
         self._cache: Dict[str, int] = {}
 
     def get_id(self, value: str) -> int:
+        """Intern a single string and return its local id."""
         sid = self._cache.get(value)
         if sid is None:
             self._conn.execute(
@@ -328,6 +345,34 @@ class _LocalStringCache:
             sid = row[0]
             self._cache[value] = sid
         return sid
+
+    def intern_batch(self, values: List[str]) -> None:
+        """Intern a list of strings in bulk (one SQL round-trip per 900 values).
+
+        After this call every string in *values* is guaranteed to have an
+        entry in ``self._cache``.  Unknown strings are inserted with
+        ``INSERT OR IGNORE`` (deduplication via UNIQUE constraint).
+        """
+        missing = [v for v in values if v not in self._cache]
+        if not missing:
+            return
+
+        # Bulk insert – one executemany, no per-row round trips.
+        self._conn.executemany(
+            "INSERT OR IGNORE INTO strings(value) VALUES (?)",
+            ((v,) for v in missing),
+        )
+
+        # Bulk read back IDs in chunks (SQLite parameter limit).
+        for i in range(0, len(missing), _SQL_PARAM_CHUNK):
+            chunk = missing[i : i + _SQL_PARAM_CHUNK]
+            placeholders = ",".join("?" * len(chunk))
+            rows = self._conn.execute(
+                f"SELECT value, id FROM strings WHERE value IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            for val, sid in rows:
+                self._cache[val] = sid
 
 
 class _LocalCategoryCache:
@@ -351,6 +396,25 @@ class _LocalCategoryCache:
             cid = row[0]
             self._cache[name] = cid
         return cid
+
+    def intern_batch(self, names: List[str]) -> None:
+        """Intern a list of category names in bulk."""
+        missing = [n for n in names if n not in self._cache]
+        if not missing:
+            return
+        self._conn.executemany(
+            "INSERT OR IGNORE INTO categories(name) VALUES (?)",
+            ((n,) for n in missing),
+        )
+        for i in range(0, len(missing), _SQL_PARAM_CHUNK):
+            chunk = missing[i : i + _SQL_PARAM_CHUNK]
+            placeholders = ",".join("?" * len(chunk))
+            rows = self._conn.execute(
+                f"SELECT name, id FROM categories WHERE name IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            for cat_name, cid in rows:
+                self._cache[cat_name] = cid
 
 
 # ---------------------------------------------------------------------------
@@ -393,37 +457,87 @@ def _write_countries_worker(
         )
 
 
-def _write_place_worker(
+def _write_places_batch(
     conn: sqlite3.Connection,
-    place: Dict,
-    place_id: int,
+    parsed_places: List[Dict],
     strings: _LocalStringCache,
     cats: _LocalCategoryCache,
     photon_to_db: Dict[str, Tuple[int, Optional[str], Optional[str]]],
 ) -> None:
-    """Insert one parsed place into the worker database."""
-    # Resolve addresslines -> extra address components (within this worker).
-    extra_addresses: List[Tuple[str, str, str]] = []
-    for ref in place.get("addresslines", []):
-        ref_pid = str(ref.get("place_id", ""))
-        if ref_pid and ref_pid in photon_to_db:
-            _ref_db_id, ref_addr_type, ref_name = photon_to_db[ref_pid]
-            if ref.get("isaddress") and ref_addr_type and ref_name:
-                extra_addresses.append((ref_addr_type, "default", ref_name))
+    """Bulk-write a list of already-parsed places into the worker database.
 
-    all_addresses: List[Tuple[str, str, str]] = list(place["addresses"]) + extra_addresses
+    This function batches all SQL work for a collection of places into a
+    minimal number of round trips:
 
-    conn.execute(
-        """
-        INSERT INTO places (
-            id, photon_id, osm_type, osm_id, osm_key, osm_value,
-            address_type, importance, country_code, postcode, housenumber,
-            lat, lon, bbox_min_lon, bbox_min_lat, bbox_max_lon, bbox_max_lat,
-            extra
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """,
-        (
-            place_id,
+    1. Ensure all referenced country codes exist (INSERT OR IGNORE).
+    2. Bulk-intern all strings and categories used by the batch.
+    3. Insert all place rows with one ``executemany``.
+    4. Build and insert place_names / place_addresses / place_categories /
+       fts_data / rtree_data rows with one ``executemany`` each.
+    """
+    if not parsed_places:
+        return
+
+    # ---- 0. Resolve addresslines (must be done in order) --------------------
+    # We need photon_to_db to be up-to-date for each place's addresslines.
+    # Build the resolved addresses list in order while we still process
+    # places sequentially; the actual SQL writes below are then all batched.
+    all_addresses_per_place: List[List[Tuple[str, str, str]]] = []
+    for place in parsed_places:
+        extra_addresses: List[Tuple[str, str, str]] = []
+        for ref in place.get("addresslines", []):
+            ref_pid = str(ref.get("place_id", ""))
+            if ref_pid and ref_pid in photon_to_db:
+                _ref_db_id, ref_addr_type, ref_name = photon_to_db[ref_pid]
+                if ref.get("isaddress") and ref_addr_type and ref_name:
+                    extra_addresses.append((ref_addr_type, "default", ref_name))
+        all_addresses = list(place["addresses"]) + extra_addresses
+        all_addresses_per_place.append(all_addresses)
+        # Update photon_to_db for subsequent places in this batch.
+        primary_name: Optional[str] = next(
+            (v for v, l, k in place["names"] if l == "default" and k == "name"),
+            next((v for v, _l, k in place["names"] if k == "name"), None),
+        )
+        photon_id = place["photon_id"]
+        if photon_id:
+            photon_to_db[photon_id] = (
+                place["_place_id"],
+                place["address_type"],
+                primary_name,
+            )
+
+    # ---- 1. Ensure country codes exist (FK safety without FK checks) --------
+    # Because workers use PRAGMA foreign_keys=OFF this is technically not
+    # needed for the worker DB, but it ensures the merge step finds the
+    # country rows when it cross-references w.places -> main.countries.
+    country_codes: Set[str] = {
+        p["country_code"]
+        for p in parsed_places
+        if p["country_code"] is not None
+    }
+    if country_codes:
+        conn.executemany(
+            "INSERT OR IGNORE INTO countries(code, names) VALUES (?, X'')",
+            ((code,) for code in country_codes),
+        )
+
+    # ---- 2. Bulk-intern all strings and categories --------------------------
+    all_strings: List[str] = []
+    all_cat_names: List[str] = []
+    for place, all_addresses in zip(parsed_places, all_addresses_per_place):
+        all_strings.extend(v for v, _l, _k in place["names"])
+        all_strings.extend(v for _t, _l, v in all_addresses)
+        all_cat_names.extend(place["categories"])
+
+    # Deduplicate before interning.
+    strings.intern_batch(list(dict.fromkeys(all_strings)))
+    cats.intern_batch(list(dict.fromkeys(all_cat_names)))
+
+    # ---- 3. Bulk-insert place rows ------------------------------------------
+    place_rows: List[Tuple] = []
+    for place in parsed_places:
+        place_rows.append((
+            place["_place_id"],
             place["photon_id"],
             place["osm_type"],
             place["osm_id"],
@@ -441,95 +555,101 @@ def _write_place_worker(
             place["bbox_max_lon"],
             place["bbox_max_lat"],
             place["extra"],
-        ),
+        ))
+    conn.executemany(
+        """
+        INSERT OR IGNORE INTO places (
+            id, photon_id, osm_type, osm_id, osm_key, osm_value,
+            address_type, importance, country_code, postcode, housenumber,
+            lat, lon, bbox_min_lon, bbox_min_lat, bbox_max_lon, bbox_max_lat,
+            extra
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        place_rows,
     )
 
-    # Intern all strings needed by this place in one batch.
-    all_str_values = list(
-        {v for v, _l, _k in place["names"]}
-        | {v for _t, _l, v in all_addresses}
-    )
-    sid_map: Dict[str, int] = {v: strings.get_id(v) for v in all_str_values}
-
-    # place_names
-    seen_pn: Set[Tuple] = set()
+    # ---- 4. Bulk-insert child rows ------------------------------------------
     name_rows: List[Tuple] = []
-    for value, lang, kind in place["names"]:
-        sid = sid_map.get(value)
-        if sid is None:
-            continue
-        row = (place_id, sid, lang, kind)
-        if row not in seen_pn:
-            seen_pn.add(row)
-            name_rows.append(row)
+    addr_rows: List[Tuple] = []
+    cat_rows: List[Tuple] = []
+    fts_rows: List[Tuple] = []
+    rtree_rows: List[Tuple] = []
+
+    seen_pn: Set[Tuple] = set()
+    seen_pa: Set[Tuple] = set()
+
+    for place, all_addresses in zip(parsed_places, all_addresses_per_place):
+        pid = place["_place_id"]
+
+        for value, lang, kind in place["names"]:
+            sid = strings._cache.get(value)
+            if sid is None:
+                continue
+            row = (pid, sid, lang, kind)
+            if row not in seen_pn:
+                seen_pn.add(row)
+                name_rows.append(row)
+
+        for addr_type, lang, value in all_addresses:
+            sid = strings._cache.get(value)
+            if sid is None:
+                continue
+            row = (pid, sid, addr_type, lang)
+            if row not in seen_pa:
+                seen_pa.add(row)
+                addr_rows.append(row)
+
+        for cat in place["categories"]:
+            cid = cats._cache.get(cat)
+            if cid is None:
+                continue
+            cat_rows.append((pid, cid))
+
+        fts_names = " ".join(sorted({v for v, _l, _k in place["names"]}))
+        if place.get("postcode"):
+            fts_names += " " + place["postcode"]
+        if place.get("housenumber"):
+            fts_names += " " + place["housenumber"]
+        fts_addr = " ".join(sorted({v for _t, _l, v in all_addresses}))
+        fts_rows.append((pid, fts_names.strip(), fts_addr.strip()))
+
+        rtree_rows.append((
+            pid,
+            place["bbox_min_lat"],
+            place["bbox_max_lat"],
+            place["bbox_min_lon"],
+            place["bbox_max_lon"],
+        ))
+
     if name_rows:
         conn.executemany(
             "INSERT OR IGNORE INTO place_names(place_id, string_id, lang, kind) "
             "VALUES (?,?,?,?)",
             name_rows,
         )
-
-    # place_addresses
-    seen_pa: Set[Tuple] = set()
-    addr_rows: List[Tuple] = []
-    for addr_type, lang, value in all_addresses:
-        sid = sid_map.get(value)
-        if sid is None:
-            continue
-        row = (place_id, sid, addr_type, lang)
-        if row not in seen_pa:
-            seen_pa.add(row)
-            addr_rows.append(row)
     if addr_rows:
         conn.executemany(
             "INSERT OR IGNORE INTO place_addresses"
             "(place_id, string_id, addr_type, lang) VALUES (?,?,?,?)",
             addr_rows,
         )
-
-    # place_categories
-    for cat in place["categories"]:
-        cid = cats.get_id(cat)
-        conn.execute(
+    if cat_rows:
+        conn.executemany(
             "INSERT OR IGNORE INTO place_categories(place_id, category_id) "
             "VALUES (?,?)",
-            (place_id, cid),
+            cat_rows,
         )
-
-    # FTS staging
-    fts_names_parts = sorted({v for v, _l, _k in place["names"]})
-    if place.get("postcode"):
-        fts_names_parts.append(place["postcode"])
-    if place.get("housenumber"):
-        fts_names_parts.append(place["housenumber"])
-    fts_addr_parts = sorted({v for _t, _l, v in all_addresses})
-
-    conn.execute(
-        "INSERT OR REPLACE INTO fts_data(place_id, names, address) VALUES (?,?,?)",
-        (place_id, " ".join(fts_names_parts), " ".join(fts_addr_parts)),
-    )
-
-    # R-tree staging
-    conn.execute(
-        "INSERT OR REPLACE INTO rtree_data"
-        "(id, min_lat, max_lat, min_lon, max_lon) VALUES (?,?,?,?,?)",
-        (
-            place_id,
-            place["bbox_min_lat"],
-            place["bbox_max_lat"],
-            place["bbox_min_lon"],
-            place["bbox_max_lon"],
-        ),
-    )
-
-    # Update addresslines resolution map for subsequent places in this worker.
-    primary_name: Optional[str] = next(
-        (v for v, l, k in place["names"] if l == "default" and k == "name"),
-        next((v for v, _l, k in place["names"] if k == "name"), None),
-    )
-    photon_id = place["photon_id"]
-    if photon_id:
-        photon_to_db[photon_id] = (place_id, place["address_type"], primary_name)
+    if fts_rows:
+        conn.executemany(
+            "INSERT OR REPLACE INTO fts_data(place_id, names, address) VALUES (?,?,?)",
+            fts_rows,
+        )
+    if rtree_rows:
+        conn.executemany(
+            "INSERT OR REPLACE INTO rtree_data"
+            "(id, min_lat, max_lat, min_lon, max_lon) VALUES (?,?,?,?,?)",
+            rtree_rows,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -583,6 +703,10 @@ def _worker_main(
         if batch is _SENTINEL:
             break
 
+        # Parse all lines in this batch, separating country info from places.
+        batch_country_infos: List[List[Dict]] = []
+        parsed_places: List[Dict] = []
+
         for raw_line in batch:
             line = raw_line.strip()
             if not line:
@@ -604,7 +728,7 @@ def _worker_main(
 
             elif obj_type == "CountryInfo":
                 if isinstance(content, list):
-                    _write_countries_worker(conn, content, lang_set)
+                    batch_country_infos.append(content)
 
             elif obj_type == "Place":
                 if not isinstance(content, list):
@@ -617,12 +741,28 @@ def _worker_main(
                         continue
                     place_id = place_id_base + local_counter + 1
                     local_counter += 1
+                    parsed["_place_id"] = place_id
+                    parsed_places.append(parsed)
+
+        # Write countries first so place inserts find their country rows.
+        for country_list in batch_country_infos:
+            _write_countries_worker(conn, country_list, lang_set)
+
+        # Bulk-write all places from this batch.
+        if parsed_places:
+            try:
+                _write_places_batch(conn, parsed_places, strings, cats, photon_to_db)
+            except sqlite3.Error as exc:
+                log.warning("Worker %d batch write failed: %s", worker_id, exc)
+                # Fall back to per-place inserts so we lose as few places as possible.
+                for place in parsed_places:
                     try:
-                        _write_place_worker(
-                            conn, parsed, place_id, strings, cats, photon_to_db
+                        _write_places_batch(conn, [place], strings, cats, photon_to_db)
+                    except sqlite3.Error as exc2:
+                        log.debug(
+                            "Worker %d skipping place %s: %s",
+                            worker_id, place.get("photon_id"), exc2,
                         )
-                    except sqlite3.Error as exc:
-                        log.debug("Worker %d skipping place: %s", worker_id, exc)
 
         # Periodic commit to bound transaction size.
         if local_counter % _COMMIT_EVERY == 0 and local_counter > 0:
@@ -720,7 +860,20 @@ def _merge_worker_db(
         """
     )
 
-    # 6. Places - insert without explicit id so SQLite assigns new sequential IDs.
+    # 6. Ensure all country_codes referenced by the worker's places exist in
+    #    the final countries table BEFORE inserting the places.  This handles
+    #    the case where a worker's batch never contained a CountryInfo record
+    #    for a country referenced by its places.
+    final_conn.execute(
+        """
+        INSERT OR IGNORE INTO countries(code, names)
+        SELECT DISTINCT country_code, X''
+        FROM w.places
+        WHERE country_code IS NOT NULL
+        """
+    )
+
+    # 7. Places - insert without explicit id so SQLite assigns new sequential IDs.
     #    We capture the current max id before insertion to build the mapping.
     base_row = final_conn.execute(
         "SELECT COALESCE(MAX(id), 0) FROM places"
@@ -751,7 +904,7 @@ def _merge_worker_db(
             """
         )
 
-        # 7. Place ID mapping using ROW_NUMBER.
+        # 8. Place ID mapping using ROW_NUMBER.
         #    Rows were inserted in w.places ORDER BY id, so the k-th inserted
         #    row (1-based) got id = base_id + k.
         final_conn.execute(
@@ -771,7 +924,7 @@ def _merge_worker_db(
             """
         )
 
-        # 8. place_names - remap place_id and string_id.
+        # 9. place_names - remap place_id and string_id.
         final_conn.execute(
             """
             INSERT OR IGNORE INTO place_names(place_id, string_id, lang, kind)
@@ -782,7 +935,7 @@ def _merge_worker_db(
             """
         )
 
-        # 9. place_addresses - remap place_id and string_id.
+        # 10. place_addresses - remap place_id and string_id.
         final_conn.execute(
             """
             INSERT OR IGNORE INTO place_addresses(place_id, string_id, addr_type, lang)
@@ -793,7 +946,7 @@ def _merge_worker_db(
             """
         )
 
-        # 10. place_categories - remap place_id and category_id.
+        # 11. place_categories - remap place_id and category_id.
         final_conn.execute(
             """
             INSERT OR IGNORE INTO place_categories(place_id, category_id)
@@ -804,7 +957,7 @@ def _merge_worker_db(
             """
         )
 
-        # 11. FTS5 - remap place_id; insert into virtual table.
+        # 12. FTS5 - remap place_id; insert into virtual table.
         final_conn.execute(
             """
             INSERT INTO places_fts(place_id, names, address)
@@ -814,7 +967,7 @@ def _merge_worker_db(
             """
         )
 
-        # 12. R-tree - remap id.
+        # 13. R-tree - remap id.
         final_conn.execute(
             """
             INSERT INTO places_rtree(id, min_lat, max_lat, min_lon, max_lon)
