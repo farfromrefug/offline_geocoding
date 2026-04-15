@@ -1,17 +1,41 @@
 """SQLite database schema for offline geocoding.
 
-Tables
-------
+Design Goals
+------------
+* **Zero cross-worker duplication** – strings and categories are interned and
+  identified by integer primary key.  Multiple worker processes each build
+  their own temporary database; a SQL-driven merge step deduplicates across
+  workers using temp mapping tables.
+* **Compact storage** – shared ``strings`` table means "Paris" is stored once
+  even if thousands of places reference it as a city or name.
+* **Language-aware queries** – country names stored as a gzip-compressed JSON
+  map ``{lang: name}``; all other name/address variants stored as rows in
+  ``place_names`` / ``place_addresses`` with an explicit ``lang`` column.
+* **Fast search** – FTS5 with trigram tokeniser for fuzzy substring matching;
+  R-tree for reverse geocoding.
+
+Tables (final database)
+-----------------------
 metadata          – key/value store for import settings
-countries         – deduplicated ISO country codes + gzip-compressed name map
-strings           – deduplicated name/address strings (normalised, shared)
-categories        – deduplicated OSM category strings
-places            – main place table (one row per photon place entry)
-place_names       – N:M: place <-> string, with lang + kind columns
-place_addresses   – N:M: place <-> string, with addr_type + lang columns
-place_categories  – N:M: place <-> category
-places_fts        – FTS5 virtual table with trigram tokeniser (fuzzy search)
+countries         – ISO country codes keyed by ``code TEXT PRIMARY KEY``
+                    + gzip-compressed JSON name map  (lang → name)
+strings           – interned text values; INTEGER PRIMARY KEY (AUTOINCREMENT)
+categories        – interned OSM category strings; INTEGER PRIMARY KEY
+places            – one row per photon place entry; references country by code
+place_names       – N:M place ↔ string with lang + kind columns
+place_addresses   – N:M place ↔ string with addr_type + lang columns
+place_categories  – N:M place ↔ category
+places_fts        – FTS5 virtual table, trigram tokeniser (fuzzy search)
 places_rtree      – R-tree spatial index for reverse geocoding
+
+Worker databases (temporary, one per worker process)
+-----------------------------------------------------
+Same as above *minus* the virtual tables (FTS5 / R-tree).
+Instead two plain tables hold the data that will be loaded into the virtual
+tables during the final merge step:
+
+fts_data   – (place_id, names TEXT, address TEXT)
+rtree_data – (id, min_lat, max_lat, min_lon, max_lon)
 """
 
 import gzip
@@ -23,7 +47,7 @@ from typing import Any, List
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Schema DDL
+# Schema DDL – shared between final and worker databases
 # ---------------------------------------------------------------------------
 
 _PRAGMA = """
@@ -35,37 +59,46 @@ PRAGMA mmap_size    = 268435456;
 PRAGMA foreign_keys = ON;
 """
 
-_TABLES = """
+# Tables present in BOTH the final database and every worker database.
+_COMMON_TABLES = """
 CREATE TABLE IF NOT EXISTS metadata (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
 
--- Deduplicated country records.
--- `names` is a gzip-compressed JSON object mapping lang -> localised name.
+-- One row per country.
+-- ``code`` is the ISO 3166-1 alpha-2 code used as a natural key.
+-- ``names`` is a gzip-compressed JSON object mapping lang -> localised name,
+-- e.g. {"default": "France", "en": "France", "fr": "France"}.
+-- Queries decompress this blob in Python and look up by language code,
+-- so country names support the same multi-language query as place names.
 CREATE TABLE IF NOT EXISTS countries (
-    id   INTEGER PRIMARY KEY,
-    code TEXT UNIQUE NOT NULL,
+    code  TEXT PRIMARY KEY,
     names BLOB NOT NULL DEFAULT X''
 );
 
--- Deduplicated text strings shared by place_names and place_addresses.
+-- Interned text strings.  Every unique address component, place name, etc.
+-- is stored exactly once here.  ``id`` is an AUTOINCREMENT integer assigned
+-- locally within each worker; the merge step remaps these to globally unique
+-- IDs in the final database.
 CREATE TABLE IF NOT EXISTS strings (
     id    INTEGER PRIMARY KEY,
     value TEXT UNIQUE NOT NULL
 );
 
--- Deduplicated OSM category strings (e.g. "amenity.restaurant").
+-- Interned OSM category strings (e.g. "amenity.restaurant").
+-- Same AUTOINCREMENT + merge-remap approach as strings.
 CREATE TABLE IF NOT EXISTS categories (
     id   INTEGER PRIMARY KEY,
     name TEXT UNIQUE NOT NULL
 );
 
 -- Core place record.
--- centroid is stored as (lat, lon) and bbox likewise (WGS84).
--- `extra` is a gzip-compressed JSON blob of arbitrary extra tags.
+-- ``country_code`` references countries(code) directly – no integer FK
+-- indirection – so the merge step does not need to remap country IDs.
+-- ``extra`` is a gzip-compressed JSON blob of arbitrary extra OSM tags.
 CREATE TABLE IF NOT EXISTS places (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    id           INTEGER PRIMARY KEY,
     photon_id    TEXT,
     osm_type     TEXT,
     osm_id       INTEGER,
@@ -73,7 +106,7 @@ CREATE TABLE IF NOT EXISTS places (
     osm_value    TEXT,
     address_type TEXT,
     importance   REAL    NOT NULL DEFAULT 0.0,
-    country_id   INTEGER REFERENCES countries(id),
+    country_code TEXT    REFERENCES countries(code),
     postcode     TEXT,
     housenumber  TEXT,
     lat          REAL    NOT NULL,
@@ -86,7 +119,7 @@ CREATE TABLE IF NOT EXISTS places (
 );
 
 -- Multilingual names for a place.
--- lang: 'default' for the bare `name` tag, otherwise an ISO language code.
+-- lang: 'default' for the bare OSM ``name`` tag, otherwise ISO language code.
 -- kind: 'name' | 'alt' | 'old' | 'int' | 'loc' | 'short' | 'official'
 CREATE TABLE IF NOT EXISTS place_names (
     place_id  INTEGER NOT NULL REFERENCES places(id)  ON DELETE CASCADE,
@@ -116,6 +149,26 @@ CREATE TABLE IF NOT EXISTS place_categories (
 );
 """
 
+# Worker-only tables that hold data destined for the final virtual tables.
+_WORKER_PLAIN_TABLES = """
+-- Staging table for FTS5 data; populated in each worker, merged into
+-- the final ``places_fts`` virtual table during the merge step.
+CREATE TABLE IF NOT EXISTS fts_data (
+    place_id INTEGER PRIMARY KEY,
+    names    TEXT NOT NULL DEFAULT '',
+    address  TEXT NOT NULL DEFAULT ''
+);
+
+-- Staging table for R-tree data; same lifecycle as fts_data.
+CREATE TABLE IF NOT EXISTS rtree_data (
+    id      INTEGER PRIMARY KEY,
+    min_lat REAL NOT NULL,
+    max_lat REAL NOT NULL,
+    min_lon REAL NOT NULL,
+    max_lon REAL NOT NULL
+);
+"""
+
 # FTS5 with trigram tokeniser – enables efficient substring / fuzzy search.
 # `names`   : space-separated concatenation of all name variants (all langs).
 # `address` : space-separated concatenation of all address tokens (all langs).
@@ -138,7 +191,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS places_rtree USING rtree(
 """
 
 _INDEXES = """
-CREATE INDEX IF NOT EXISTS idx_places_country    ON places(country_id);
+CREATE INDEX IF NOT EXISTS idx_places_country    ON places(country_code);
 CREATE INDEX IF NOT EXISTS idx_places_osm        ON places(osm_type, osm_id);
 CREATE INDEX IF NOT EXISTS idx_places_importance ON places(importance DESC);
 CREATE INDEX IF NOT EXISTS idx_places_photon_id  ON places(photon_id);
@@ -153,15 +206,8 @@ CREATE INDEX IF NOT EXISTS idx_place_cat_place   ON place_categories(place_id);
 # Public helpers
 # ---------------------------------------------------------------------------
 
-def create_database(path: str) -> sqlite3.Connection:
-    """Create (or open) the geocoding database at *path* and apply the schema.
-
-    Returns an open :class:`sqlite3.Connection`.
-    """
-    conn = sqlite3.connect(path, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-
-    # Check FTS5 trigram availability (added in SQLite 3.34.0).
+def _check_sqlite_version() -> None:
+    """Raise ``RuntimeError`` if SQLite is too old for the trigram tokeniser."""
     sqlite_ver = tuple(int(x) for x in sqlite3.sqlite_version.split("."))
     if sqlite_ver < (3, 34, 0):
         raise RuntimeError(
@@ -169,10 +215,43 @@ def create_database(path: str) -> sqlite3.Connection:
             "tokeniser. Please upgrade to SQLite >= 3.34.0."
         )
 
-    for stmt in _split_statements(_PRAGMA):
-        conn.execute(stmt)
 
-    for block in (_TABLES, _FTS, _RTREE, _INDEXES):
+def create_database(path: str) -> sqlite3.Connection:
+    """Create (or open) the **final** geocoding database and apply its schema.
+
+    The final database has FTS5 and R-tree virtual tables in addition to all
+    common tables.
+
+    Returns an open :class:`sqlite3.Connection`.
+    """
+    _check_sqlite_version()
+    conn = sqlite3.connect(path, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    _apply_pragma(conn)
+
+    for block in (_COMMON_TABLES, _FTS, _RTREE, _INDEXES):
+        for stmt in _split_statements(block):
+            conn.execute(stmt)
+
+    conn.commit()
+    return conn
+
+
+def create_worker_database(path: str) -> sqlite3.Connection:
+    """Create a **worker** temporary database used during parallel import.
+
+    Worker databases contain the same relational tables as the final database
+    but use plain ``fts_data`` / ``rtree_data`` tables instead of virtual
+    tables.  This avoids virtual-table overhead during high-throughput writes
+    and ensures that ATTACH-based merging works reliably.
+
+    Returns an open :class:`sqlite3.Connection`.
+    """
+    conn = sqlite3.connect(path, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    _apply_pragma(conn)
+
+    for block in (_COMMON_TABLES, _WORKER_PLAIN_TABLES):
         for stmt in _split_statements(block):
             conn.execute(stmt)
 
@@ -182,6 +261,10 @@ def create_database(path: str) -> sqlite3.Connection:
 
 def apply_pragmas(conn: sqlite3.Connection) -> None:
     """Re-apply per-connection PRAGMAs (call after every new connection)."""
+    _apply_pragma(conn)
+
+
+def _apply_pragma(conn: sqlite3.Connection) -> None:
     for stmt in _split_statements(_PRAGMA):
         conn.execute(stmt)
 

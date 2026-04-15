@@ -76,10 +76,62 @@ def _get_supported_languages(conn: sqlite3.Connection) -> List[str]:
     return []
 
 
+def _resolve_country_name(
+    conn: sqlite3.Connection,
+    country_code: Optional[str],
+    languages: List[str],
+    cache: Dict[str, Optional[str]],
+) -> Optional[str]:
+    """Return the localised country name for *country_code*.
+
+    Results are memoised in *cache* (keyed by country_code + language list
+    fingerprint) to avoid re-decompressing the same blob for every result in
+    a search response.
+
+    The country ``names`` column is a gzip-compressed JSON object mapping
+    language code -> localised name, e.g.::
+
+        {"default": "France", "en": "France", "fr": "France"}
+
+    Lookup strategy:
+    1. Try each language in *languages* in order.
+    2. Fall back to the ``"default"`` entry (the bare OSM ``name`` tag).
+    """
+    if not country_code:
+        return None
+
+    # Build a cache key that incorporates the requested language order.
+    lang_key = f"{country_code}|{','.join(languages)}"
+    if lang_key in cache:
+        return cache[lang_key]
+
+    c_row = conn.execute(
+        "SELECT names FROM countries WHERE code = ?",
+        (country_code,),
+    ).fetchone()
+
+    country_name: Optional[str] = None
+    if c_row and c_row["names"]:
+        try:
+            cnames = decompress_json(c_row["names"])
+            for lang in languages:
+                if lang in cnames:
+                    country_name = cnames[lang]
+                    break
+            if country_name is None:
+                country_name = cnames.get("default")
+        except Exception:
+            pass
+
+    cache[lang_key] = country_name
+    return country_name
+
+
 def _format_place(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
     languages: Optional[List[str]] = None,
+    country_cache: Optional[Dict[str, Optional[str]]] = None,
 ) -> Dict[str, Any]:
     """Convert a ``places`` table row into a result dictionary.
 
@@ -92,11 +144,18 @@ def _format_place(
     languages:
         Preferred language order for name resolution.  Defaults to the
         languages stored in the database.
+    country_cache:
+        Optional shared dict used to cache decompressed country name blobs
+        across multiple calls.  Pass the same dict for all results in a
+        single query to avoid redundant decompression.
     """
     place_id: int = row["id"]
 
     if languages is None:
         languages = _get_supported_languages(conn)
+
+    if country_cache is None:
+        country_cache = {}
 
     # Build {(lang, kind): name_value} from place_names + strings.
     name_rows = conn.execute(
@@ -140,7 +199,11 @@ def _format_place(
 
     address: Dict[str, str] = {}
     for ar in addr_rows:
-        key = ar["addr_type"] if ar["lang"] == "default" else f"{ar['addr_type']}:{ar['lang']}"
+        key = (
+            ar["addr_type"]
+            if ar["lang"] == "default"
+            else f"{ar['addr_type']}:{ar['lang']}"
+        )
         address[key] = ar["value"]
 
     # Categories.
@@ -155,27 +218,12 @@ def _format_place(
     ).fetchall()
     category_list = [r["name"] for r in cat_rows]
 
-    # Country name.
-    country_name: Optional[str] = None
-    country_code: Optional[str] = None
-    if row["country_id"]:
-        c_row = conn.execute(
-            "SELECT code, names FROM countries WHERE id = ?",
-            (row["country_id"],),
-        ).fetchone()
-        if c_row:
-            country_code = c_row["code"]
-            if c_row["names"]:
-                try:
-                    cnames = decompress_json(c_row["names"])
-                    for lang in (languages or []):
-                        if lang in cnames:
-                            country_name = cnames[lang]
-                            break
-                    if country_name is None:
-                        country_name = cnames.get("default")
-                except Exception:
-                    pass
+    # Country name – looked up by the TEXT country_code column (no integer FK).
+    # Uses the per-call cache to avoid redundant blob decompression.
+    country_code: Optional[str] = row["country_code"]
+    country_name = _resolve_country_name(
+        conn, country_code, languages or [], country_cache
+    )
 
     # Extra tags.
     extra: Optional[Dict] = None
@@ -202,7 +250,9 @@ def _format_place(
             row["bbox_min_lat"],
             row["bbox_max_lon"],
             row["bbox_max_lat"],
-        ) if row["bbox_min_lon"] is not None else None,
+        )
+        if row["bbox_min_lon"] is not None
+        else None,
         "postcode": row["postcode"],
         "housenumber": row["housenumber"],
         "country_code": country_code,
@@ -289,7 +339,8 @@ def search(
             params = (fts_query, limit, offset)
 
         rows = conn.execute(sql, params).fetchall()
-        return [_format_place(conn, r, languages) for r in rows]
+        country_cache: Dict[str, Optional[str]] = {}
+        return [_format_place(conn, r, languages, country_cache) for r in rows]
     finally:
         if should_close:
             conn.close()
@@ -381,8 +432,9 @@ def reverse(
 
         rows = conn.execute(sql, params).fetchall()
         results: List[Dict[str, Any]] = []
+        country_cache: Dict[str, Optional[str]] = {}
         for row in rows:
-            place = _format_place(conn, row, languages)
+            place = _format_place(conn, row, languages, country_cache)
             dist_sq = row["dist_sq"]
             place["distance_deg"] = math.sqrt(dist_sq) if dist_sq >= 0 else 0.0
             results.append(place)

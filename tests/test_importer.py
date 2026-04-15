@@ -18,7 +18,7 @@ from offline_geocoding.importer import (
     _parse_place_entry,
     import_database,
 )
-from offline_geocoding.schema import create_database
+from offline_geocoding.schema import create_database, create_worker_database
 
 
 # ---------------------------------------------------------------------------
@@ -267,9 +267,13 @@ def test_import_basic(tmp_path):
     str_count = conn.execute("SELECT COUNT(*) FROM strings").fetchone()[0]
     assert str_count > 0
 
-    # Country should be recorded.
+    # Country should be recorded by code (TEXT PK).
     cc = conn.execute("SELECT COUNT(*) FROM countries WHERE code = 'fr'").fetchone()[0]
     assert cc == 1
+
+    # places.country_code must be the TEXT code, not an integer FK.
+    row = conn.execute("SELECT country_code FROM places LIMIT 1").fetchone()
+    assert row["country_code"] == "fr"
 
     # R-tree entries.
     rt_count = conn.execute("SELECT COUNT(*) FROM places_rtree").fetchone()[0]
@@ -370,6 +374,46 @@ def test_import_no_duplicate_strings(tmp_path):
     conn.close()
 
 
+def test_import_no_duplicate_strings_multi_worker(tmp_path):
+    """Strings are globally deduplicated even across multiple workers."""
+    # Three places all sharing "Paris" and "France" strings.
+    entry3 = {
+        **EIFFEL_ENTRY,
+        "place_id": 3,
+        "address": {"city": "Paris", "country": "France"},
+        "centroid": [2.30, 48.86],
+    }
+    entry4 = {
+        **PARIS_ENTRY,
+        "place_id": 4,
+        "centroid": [2.35, 48.85],
+        "address": {"country": "France", "city": "Paris"},
+    }
+    jsonl_path = _write_jsonl(tmp_path, [PARIS_ENTRY, EIFFEL_ENTRY, entry3, entry4])
+    db_path = str(tmp_path / "geo_multi.db")
+
+    import_database(
+        input_path=jsonl_path,
+        output_path=db_path,
+        languages=["en", "fr"],
+        num_workers=2,
+        batch_size=2,  # Small batch to force both workers to get data
+        show_progress=False,
+    )
+
+    conn = sqlite3.connect(db_path)
+    # No string should appear more than once after the merge.
+    dups = conn.execute(
+        "SELECT value, COUNT(*) as c FROM strings GROUP BY value HAVING c > 1"
+    ).fetchall()
+    assert len(dups) == 0, f"Duplicate strings after multi-worker import: {[r[0] for r in dups]}"
+
+    # All places imported.
+    count = conn.execute("SELECT COUNT(*) FROM places").fetchone()[0]
+    assert count == 4
+    conn.close()
+
+
 def test_import_metadata(tmp_path):
     jsonl_path = _write_jsonl(tmp_path, [])
     db_path = str(tmp_path / "meta.db")
@@ -390,3 +434,30 @@ def test_import_metadata(tmp_path):
     langs = json.loads(row[0])
     assert langs == ["en", "fr"]
     conn.close()
+
+
+def test_import_country_names_language(tmp_path):
+    """Country names are stored in the countries table with language keys."""
+    jsonl_path = _write_jsonl(tmp_path, [PARIS_ENTRY])
+    db_path = str(tmp_path / "geo_cn.db")
+
+    import_database(
+        input_path=jsonl_path,
+        output_path=db_path,
+        languages=["en", "fr"],
+        num_workers=1,
+        show_progress=False,
+    )
+
+    import gzip as _gzip
+    conn = sqlite3.connect(db_path)
+    row = conn.execute("SELECT names FROM countries WHERE code = 'fr'").fetchone()
+    assert row is not None
+    names_blob = row[0]
+    assert isinstance(names_blob, bytes) and len(names_blob) > 0
+    names = json.loads(_gzip.decompress(names_blob).decode())
+    # Should have 'en', 'fr', and 'default' entries.
+    assert "en" in names or "default" in names
+    assert "fr" in names
+    conn.close()
+
