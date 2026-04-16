@@ -119,6 +119,8 @@ def db_path(tmp_path_factory):
         languages=["en", "fr"],
         num_workers=1,
         show_progress=False,
+        store_extra=True,   # enable extra storage so test_search_extra_decompressed passes
+        tag_filter=set(),   # no filtering for test data
     )
     return db
 

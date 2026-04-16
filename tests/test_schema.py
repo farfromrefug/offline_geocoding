@@ -30,7 +30,6 @@ def test_create_database(tmp_path):
     for expected in (
         "metadata",
         "langs",
-        "name_kinds",
         "addr_types",
         "countries",
         "country_names",
@@ -45,6 +44,9 @@ def test_create_database(tmp_path):
         "place_osm_tags",
     ):
         assert expected in tables, f"Missing table: {expected}"
+
+    # name_kinds table must NOT exist — kind_id uses hardcoded NAME_KIND_IDS.
+    assert "name_kinds" not in tables, "name_kinds table should have been removed"
 
     # Check virtual tables.
     vtabs = {
@@ -70,12 +72,18 @@ def test_langs_pre_seeded(tmp_path):
     conn.close()
 
 
-def test_name_kinds_pre_seeded(tmp_path):
-    """name_kinds must be pre-seeded with all 7 kinds."""
+def test_name_kinds_table_absent(tmp_path):
+    """name_kinds table must NOT exist — kind_id uses the hardcoded NAME_KIND_IDS mapping."""
     conn = create_database(str(tmp_path / "test.db"))
-    rows = conn.execute("SELECT kind FROM name_kinds").fetchall()
-    kinds = {r[0] for r in rows}
-    assert kinds == set(NAME_KIND_IDS.keys())
+    tables = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+    assert "name_kinds" not in tables, (
+        "name_kinds table should be absent; kind_id uses NAME_KIND_IDS directly"
+    )
     conn.close()
 
 
@@ -125,13 +133,14 @@ def test_country_names_table(tmp_path):
 
 
 def test_places_no_bbox_no_osm_type(tmp_path):
-    """places must NOT have bbox or osm_type columns."""
+    """places must NOT have bbox, osm_type, or photon_id columns."""
     conn = create_database(str(tmp_path / "test.db"))
     col_names = [
         r[1] for r in conn.execute("PRAGMA table_info(places)").fetchall()
     ]
     # Removed columns
-    for removed in ("bbox_min_lon", "bbox_min_lat", "bbox_max_lon", "bbox_max_lat", "osm_type"):
+    for removed in ("bbox_min_lon", "bbox_min_lat", "bbox_max_lon", "bbox_max_lat",
+                    "osm_type", "photon_id"):
         assert removed not in col_names, f"Unexpected column: {removed}"
     # Present columns
     for present in ("id", "lat", "lon", "osm_key_id", "osm_value_id",

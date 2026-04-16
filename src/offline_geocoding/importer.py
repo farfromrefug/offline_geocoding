@@ -136,9 +136,6 @@ _COMMIT_EVERY = 50_000
 # Sentinel value put on the work queue to tell a worker to shut down.
 _SENTINEL = None
 
-# Each worker is allocated this many consecutive place IDs.
-_PLACES_PER_WORKER = 50_000_000
-
 # Maximum number of parameters in a single SQLite statement.
 _SQL_PARAM_CHUNK = 900
 
@@ -147,6 +144,43 @@ _TAG_TRANSLATIONS_URL = (
     "https://raw.githubusercontent.com/plepe/openstreetmap-tag-translations"
     "/refs/heads/master/tags/{lang}.json"
 )
+
+# ---------------------------------------------------------------------------
+# Default OSM tag filter
+# ---------------------------------------------------------------------------
+# Places whose (osm_key, osm_value) matches an entry here are skipped during
+# import.  Use None as osm_value to block all values for that key.
+# Callers can override this with import_database(..., tag_filter=...).
+_DEFAULT_TAG_FILTER: Set[Tuple[Optional[str], Optional[str]]] = {
+    # Large administrative / political boundaries – too coarse for geocoding
+    ("boundary", "administrative"),
+    ("boundary", "maritime"),
+    ("boundary", "political"),
+    ("boundary", "postal_code"),
+    # Entire continents / oceans – useless for reverse geocoding
+    ("place", "continent"),
+    ("place", "ocean"),
+    ("natural", "sea"),
+    ("natural", "ocean"),
+    ("natural", "bay"),
+}
+
+
+def _matches_tag_filter(
+    osm_key: Optional[str],
+    osm_value: Optional[str],
+    tag_filter: Set[Tuple[Optional[str], Optional[str]]],
+) -> bool:
+    """Return True if this (key, value) pair should be skipped."""
+    if not tag_filter:
+        return False
+    # Exact (key, value) match.
+    if (osm_key, osm_value) in tag_filter:
+        return True
+    # Key-only match (osm_value=None in filter means "all values").
+    if (osm_key, None) in tag_filter:
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -233,15 +267,35 @@ def _extract_addresses(
     return results
 
 
+def _parse_photon_id(raw: Any) -> Optional[int]:
+    """Convert the photon ``place_id`` field to an integer, or return None."""
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, float) and raw == int(raw):
+        return int(raw)
+    if isinstance(raw, str):
+        s = raw.strip()
+        if s.lstrip("-").isdigit():
+            return int(s)
+    return None
+
+
 def _parse_place_entry(
     entry: Dict,
     lang_set: Set[str],
     poly_filter: Optional[PolyFilter],
+    tag_filter: Optional[Set[Tuple[Optional[str], Optional[str]]]] = None,
+    store_extra: bool = False,
 ) -> Optional[Dict]:
     """Parse one place sub-entry from a photon ``Place`` object.
 
-    Returns ``None`` if the entry is invalid or filtered out.
+    Returns ``None`` if the entry is invalid, filtered out, or has no valid
+    integer place_id (used as the database primary key).
     """
+    place_id = _parse_photon_id(entry.get("place_id"))
+    if place_id is None:
+        return None
+
     centroid = entry.get("centroid")
     if not centroid or len(centroid) < 2:
         return None
@@ -255,6 +309,12 @@ def _parse_place_entry(
     if poly_filter is not None and not poly_filter.contains(lon, lat):
         return None
 
+    osm_key   = _scalar(entry.get("osm_key"))
+    osm_value = _scalar(entry.get("osm_value"))
+
+    if tag_filter and _matches_tag_filter(osm_key, osm_value, tag_filter):
+        return None
+
     names = _extract_names(entry.get("name"), lang_set)
     addresses = _extract_addresses(entry.get("address"), lang_set)
 
@@ -264,8 +324,11 @@ def _parse_place_entry(
         if isinstance(c, str) and c.strip()
     ]
 
-    extra = entry.get("extra")
-    extra_blob: Optional[bytes] = compress_json(extra) if extra else None
+    extra_blob: Optional[bytes] = None
+    if store_extra:
+        extra = entry.get("extra")
+        if extra:
+            extra_blob = compress_json(extra)
 
     cc = entry.get("country_code")
     country_code: Optional[str] = cc.lower() if isinstance(cc, str) and cc else None
@@ -277,10 +340,10 @@ def _parse_place_entry(
         importance = 0.0
 
     return {
-        "photon_id":    str(entry.get("place_id", "")),
+        "_place_id":    place_id,
         "osm_id":       entry.get("object_id"),
-        "osm_key":      _scalar(entry.get("osm_key")),
-        "osm_value":    _scalar(entry.get("osm_value")),
+        "osm_key":      osm_key,
+        "osm_value":    osm_value,
         "address_type": _scalar(entry.get("address_type")),
         "importance":   importance,
         "country_code": country_code,
@@ -651,13 +714,13 @@ def _write_places_batch(
             (v for v, l, k in place["names"] if l == "default" and k == "name"),
             next((v for v, _l, k in place["names"] if k == "name"), None),
         )
-        photon_id = place["photon_id"]
-        if photon_id:
-            photon_to_db[photon_id] = (
-                place["_place_id"],
-                place["address_type"],
-                primary_name,
-            )
+        # Key is the string version of the integer place id for addressline lookups.
+        photon_key = str(place["_place_id"])
+        photon_to_db[photon_key] = (
+            place["_place_id"],
+            place["address_type"],
+            primary_name,
+        )
 
     # ---- 1. Ensure country codes exist (placeholder rows) ------------------
     country_codes: Set[str] = {
@@ -720,7 +783,6 @@ def _write_places_batch(
 
         place_rows.append((
             place["_place_id"],
-            place["photon_id"],
             place["osm_id"],
             osm_key_id,
             osm_value_id,
@@ -736,10 +798,10 @@ def _write_places_batch(
     conn.executemany(
         """
         INSERT OR IGNORE INTO places (
-            id, photon_id, osm_id, osm_key_id, osm_value_id,
+            id, osm_id, osm_key_id, osm_value_id,
             addr_type_id, importance, country_code, postcode_id, hn_id,
             lat, lon, extra
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         place_rows,
     )
@@ -758,6 +820,10 @@ def _write_places_batch(
 
     for place, all_addresses in zip(parsed_places, all_addresses_per_place):
         pid = place["_place_id"]
+        osm_key = place.get("osm_key")
+        osm_value = place.get("osm_value")
+        osm_key_id   = osm_tags._cache.get(osm_key)                    if osm_key              else None
+        osm_value_id = osm_tags._cache.get(f"{osm_key}={osm_value}")   if osm_key and osm_value else None
 
         for value, lang, kind in place["names"]:
             sid    = strings._cache.get(value)
@@ -786,10 +852,14 @@ def _write_places_batch(
             if cid is None:
                 continue
             cat_rows.append((pid, cid))
-            # Also add place_osm_tags entries for each part of this category.
+            # Add place_osm_tags entries for each token that is NOT already
+            # covered by osm_key_id / osm_value_id stored in the place row.
             for token, ctx in _parse_category_parts(cat):
                 tid = osm_tags._cache.get(ctx)
                 if tid is None:
+                    continue
+                # Skip tokens already represented by the place's key/value.
+                if tid == osm_key_id or tid == osm_value_id:
                     continue
                 key = (pid, tid)
                 if key not in seen_pot:
@@ -814,6 +884,7 @@ def _write_places_batch(
         fts_rows.append((pid, fts_names.strip(), fts_addr.strip()))
 
         # Centroid only – no bbox.  min == max satisfies the R-tree constraint.
+        # Stored as scaled integers (×LAT_LON_SCALE) for rtree_i32.
         rtree_rows.append((
             pid,
             round(place["lat"] * LAT_LON_SCALE),
@@ -863,15 +934,12 @@ def _write_places_batch(
                 rtree_rows,
             )
         else:
+            # rtree_i32: coordinates stored as 32-bit integers (×LAT_LON_SCALE).
             # Centroid point: min == max for both lat and lon.
-            scale = float(LAT_LON_SCALE)
             conn.executemany(
                 "INSERT INTO places_rtree(id, min_lat, max_lat, min_lon, max_lon)"
                 " VALUES (?,?,?,?,?)",
-                [
-                    (r[0], r[1] / scale, r[1] / scale, r[2] / scale, r[2] / scale)
-                    for r in rtree_rows
-                ],
+                [(r[0], r[1], r[1], r[2], r[2]) for r in rtree_rows],
             )
 
 
@@ -885,10 +953,16 @@ def _worker_main(
     languages: List[str],
     poly_state: Optional[list],
     worker_id: int,
-    place_id_base: int,
     translations: Optional[Dict[str, Dict[str, str]]] = None,
+    tag_filter: Optional[Set[Tuple[Optional[str], Optional[str]]]] = None,
+    store_extra: bool = False,
 ) -> None:
-    """Worker process: drain *work_queue* and write parsed results to *db_path*."""
+    """Worker process: drain *work_queue* and write parsed results to *db_path*.
+
+    Each place is stored using its Photon/Nominatim place_id as the SQLite
+    primary key, which is globally unique across all worker databases — no
+    per-worker ID allocation is needed.
+    """
     poly_filter: Optional[PolyFilter] = None
     if poly_state is not None:
         pf = PolyFilter([])
@@ -946,12 +1020,13 @@ def _worker_main(
                 for entry in content:
                     if not isinstance(entry, dict):
                         continue
-                    parsed = _parse_place_entry(entry, lang_set, poly_filter)
+                    parsed = _parse_place_entry(
+                        entry, lang_set, poly_filter,
+                        tag_filter=tag_filter, store_extra=store_extra,
+                    )
                     if parsed is None:
                         continue
-                    place_id = place_id_base + local_counter + 1
                     local_counter += 1
-                    parsed["_place_id"] = place_id
                     parsed_places.append(parsed)
 
         for country_list in batch_country_infos:
@@ -971,8 +1046,8 @@ def _worker_main(
                         )
                     except sqlite3.Error as exc2:
                         log.debug(
-                            "Worker %d skipping place %s: %s",
-                            worker_id, place.get("photon_id"), exc2,
+                            "Worker %d skipping place id=%s: %s",
+                            worker_id, place.get("_place_id"), exc2,
                         )
 
         if local_counter % _COMMIT_EVERY == 0 and local_counter > 0:
@@ -999,12 +1074,15 @@ def _merge_worker_db(
     * ``strings``, ``categories``, and ``osm_tags`` are globally deduplicated.
     * ``countries`` are inserted by TEXT primary key (code); ``country_names``
       are upserted using remapped string IDs.
-    * ``places`` receive new globally-sequential IDs via the ROW_NUMBER trick.
-    * All dependent tables are inserted with remapped IDs via JOIN.
-    * R-tree entries are inserted as centroid points (min == max) to satisfy
-      the SQLite R-tree constraint unconditionally.
+    * ``places`` are inserted with their original integer ID (= photon place_id),
+      which is globally unique — no ROW_NUMBER or ``_pmap`` remapping needed.
+      Duplicate photon_ids (same place in multiple workers) are silently skipped
+      via ``INSERT OR IGNORE``.  Dependent rows (names, addresses, etc.) for a
+      skipped place are also skipped via ``WHERE EXISTS`` guards.
+    * R-tree entries are inserted as integer centroid points (rtree_i32).
 
-    Returns the number of places merged from this worker.
+    Returns the number of places in the worker DB (some may be skipped if already
+    present from a previous worker).
     """
     final_conn.execute("PRAGMA foreign_keys = OFF")
     final_conn.execute("ATTACH DATABASE ? AS w", (worker_path,))
@@ -1118,30 +1196,26 @@ def _merge_worker_db(
             """
         )
 
-        # 10. Places - insert without explicit id so SQLite assigns new sequential IDs.
-        base_row = final_conn.execute(
-            "SELECT COALESCE(MAX(id), 0) FROM places"
-        ).fetchone()
-        base_id: int = base_row[0]
-
         worker_count_row = final_conn.execute(
             "SELECT COUNT(*) FROM w.places"
         ).fetchone()
         worker_place_count: int = worker_count_row[0]
 
         if worker_place_count > 0:
-            # Remap osm_key_id/osm_value_id via _tmap (osm_tags IDs).
-            # postcode_id and hn_id remapped via _smap (string IDs).
-            # addr_type_id is pre-seeded (same IDs everywhere) – no remap.
-            # lang_id / kind_id are also pre-seeded – no remap.
+            # 10. Places - use the worker's original id (= photon place_id) as
+            #     the final id.  INSERT OR IGNORE handles duplicate photon_ids
+            #     from multiple workers gracefully.
+            #     osm_key_id/osm_value_id remapped via _tmap (osm_tags IDs).
+            #     postcode_id and hn_id remapped via _smap (string IDs).
+            #     addr_type_id is pre-seeded (same IDs everywhere) – no remap.
             final_conn.execute(
                 """
-                INSERT INTO places(
-                    photon_id, osm_id, osm_key_id, osm_value_id, addr_type_id,
+                INSERT OR IGNORE INTO places(
+                    id, osm_id, osm_key_id, osm_value_id, addr_type_id,
                     importance, country_code, postcode_id, hn_id, lat, lon, extra
                 )
                 SELECT
-                    wp.photon_id,
+                    wp.id,
                     wp.osm_id,
                     tk.fid,
                     tv.fid,
@@ -1158,99 +1232,75 @@ def _merge_worker_db(
                 LEFT JOIN _tmap tv ON tv.wid = wp.osm_value_id
                 LEFT JOIN _smap sp ON sp.wid = wp.postcode_id
                 LEFT JOIN _smap sh ON sh.wid = wp.hn_id
-                ORDER BY wp.id
                 """
             )
 
-            # 11. Place ID mapping using ROW_NUMBER.
-            final_conn.execute(
-                "CREATE TEMP TABLE IF NOT EXISTS _pmap(wid INTEGER, fid INTEGER)"
-            )
-            final_conn.execute("DELETE FROM _pmap")
-            final_conn.execute(
-                f"""
-                WITH src AS (
-                    SELECT id AS wid,
-                           ROW_NUMBER() OVER (ORDER BY id) AS rn
-                    FROM w.places
-                )
-                INSERT INTO _pmap(wid, fid)
-                SELECT src.wid, {base_id} + src.rn
-                FROM src
-                """
-            )
-            final_conn.execute(
-                "CREATE INDEX IF NOT EXISTS _idx_pmap_wid ON _pmap(wid)"
-            )
-
-            # 12. place_names - remap place_id and string_id.
+            # 11. place_names - remap string_id via _smap.
+            #     place_id is the photon id (stable across workers).
             #     lang_id and kind_id are pre-seeded (no remap).
+            #     WHERE EXISTS guards against places skipped by INSERT OR IGNORE.
             final_conn.execute(
                 """
                 INSERT OR IGNORE INTO place_names(place_id, string_id, lang_id, kind_id)
-                SELECT pm.fid, sm.fid, pn.lang_id, pn.kind_id
+                SELECT pn.place_id, sm.fid, pn.lang_id, pn.kind_id
                 FROM w.place_names pn
-                JOIN _pmap pm ON pm.wid = pn.place_id
                 JOIN _smap sm ON sm.wid = pn.string_id
+                WHERE EXISTS (SELECT 1 FROM main.places WHERE id = pn.place_id)
                 """
             )
 
-            # 13. place_addresses - remap place_id and string_id.
+            # 12. place_addresses - remap string_id via _smap.
             #     addr_type_id and lang_id are pre-seeded (no remap).
             final_conn.execute(
                 """
                 INSERT OR IGNORE INTO place_addresses(place_id, string_id, addr_type_id, lang_id)
-                SELECT pm.fid, sm.fid, pa.addr_type_id, pa.lang_id
+                SELECT pa.place_id, sm.fid, pa.addr_type_id, pa.lang_id
                 FROM w.place_addresses pa
-                JOIN _pmap pm ON pm.wid = pa.place_id
                 JOIN _smap sm ON sm.wid = pa.string_id
+                WHERE EXISTS (SELECT 1 FROM main.places WHERE id = pa.place_id)
                 """
             )
 
-            # 14. place_categories - remap place_id and category_id.
+            # 13. place_categories - remap category_id via _cmap.
             final_conn.execute(
                 """
                 INSERT OR IGNORE INTO place_categories(place_id, category_id)
-                SELECT pm.fid, cm.fid
+                SELECT pc.place_id, cm.fid
                 FROM w.place_categories pc
-                JOIN _pmap pm ON pm.wid = pc.place_id
                 JOIN _cmap cm ON cm.wid = pc.category_id
+                WHERE EXISTS (SELECT 1 FROM main.places WHERE id = pc.place_id)
                 """
             )
 
-            # 15. place_osm_tags - remap place_id via _pmap, tag_id via _tmap.
+            # 14. place_osm_tags - remap tag_id via _tmap.
             final_conn.execute(
                 """
                 INSERT OR IGNORE INTO place_osm_tags(place_id, tag_id)
-                SELECT pm.fid, tm.fid
+                SELECT pot.place_id, tm.fid
                 FROM w.place_osm_tags pot
-                JOIN _pmap pm ON pm.wid = pot.place_id
                 JOIN _tmap tm ON tm.wid = pot.tag_id
+                WHERE EXISTS (SELECT 1 FROM main.places WHERE id = pot.place_id)
                 """
             )
 
-            # 16. FTS5 (contentless) - rowid = place_id.
+            # 15. FTS5 (contentless) - rowid = place_id.
             final_conn.execute(
                 """
                 INSERT INTO places_fts(rowid, names, address)
-                SELECT pm.fid, fd.names, fd.address
+                SELECT fd.place_id, fd.names, fd.address
                 FROM w.fts_data fd
-                JOIN _pmap pm ON pm.wid = fd.place_id
+                WHERE EXISTS (SELECT 1 FROM main.places WHERE id = fd.place_id)
                 """
             )
 
-            # 17. R-tree - centroid point: min == max for both lat and lon.
-            #     This always satisfies the R-tree constraint (min <= max).
+            # 16. R-tree (rtree_i32) - centroid point: min == max for lat and lon.
+            #     Coordinates are already scaled integers (×LAT_LON_SCALE).
             final_conn.execute(
-                f"""
+                """
                 INSERT INTO places_rtree(id, min_lat, max_lat, min_lon, max_lon)
-                SELECT pm.fid,
-                       rd.lat * 1.0 / {LAT_LON_SCALE},
-                       rd.lat * 1.0 / {LAT_LON_SCALE},
-                       rd.lon * 1.0 / {LAT_LON_SCALE},
-                       rd.lon * 1.0 / {LAT_LON_SCALE}
+                SELECT rd.id, rd.lat, rd.lat, rd.lon, rd.lon
                 FROM w.rtree_data rd
-                JOIN _pmap pm ON pm.wid = rd.id
+                WHERE EXISTS (SELECT 1 FROM main.places WHERE id = rd.id)
                 """
             )
 
@@ -1271,6 +1321,46 @@ def _merge_worker_db(
         final_conn.execute("PRAGMA foreign_keys = ON")
 
     return worker_place_count
+
+
+def _cleanup_merged_db(conn: sqlite3.Connection) -> None:
+    """Remove orphaned rows and compact the database after all workers are merged.
+
+    Orphaned strings/categories can accumulate when two workers contain the
+    same photon_id (duplicate places) — the second worker's strings are merged
+    but its place rows (and dependent rows) are skipped.  This step removes
+    the resulting orphans and runs VACUUM to compact the file.
+    """
+    conn.execute("BEGIN")
+
+    # Delete strings not referenced by any row in the database.
+    conn.execute(
+        """
+        DELETE FROM strings
+        WHERE id NOT IN (SELECT string_id FROM place_names)
+          AND id NOT IN (SELECT string_id FROM place_addresses)
+          AND id NOT IN (SELECT string_id FROM country_names)
+          AND id NOT IN (SELECT string_id FROM osm_tag_names)
+          AND id NOT IN (
+              SELECT postcode_id FROM places WHERE postcode_id IS NOT NULL)
+          AND id NOT IN (
+              SELECT hn_id FROM places WHERE hn_id IS NOT NULL)
+        """
+    )
+
+    # Delete categories not assigned to any place.
+    conn.execute(
+        """
+        DELETE FROM categories
+        WHERE id NOT IN (SELECT category_id FROM place_categories)
+        """
+    )
+
+    conn.execute("COMMIT")
+
+    # VACUUM reclaims disk space freed by the deletions and compacts the file.
+    # This runs outside a transaction (SQLite requirement).
+    conn.execute("VACUUM")
 
 
 # ---------------------------------------------------------------------------
@@ -1322,6 +1412,8 @@ def _import_single_thread(
     batch_size: int,
     show_progress: bool,
     translations: Optional[Dict[str, Dict[str, str]]] = None,
+    tag_filter: Optional[Set[Tuple[Optional[str], Optional[str]]]] = None,
+    store_extra: bool = False,
 ) -> None:
     """Import directly into the final database on a single thread."""
     poly_filter: Optional[PolyFilter] = None
@@ -1398,11 +1490,13 @@ def _import_single_thread(
                     for entry in content:
                         if not isinstance(entry, dict):
                             continue
-                        parsed = _parse_place_entry(entry, lang_set, poly_filter)
+                        parsed = _parse_place_entry(
+                            entry, lang_set, poly_filter,
+                            tag_filter=tag_filter, store_extra=store_extra,
+                        )
                         if parsed is None:
                             continue
                         total_places += 1
-                        parsed["_place_id"] = total_places
                         parsed_places.append(parsed)
 
             for country_list in batch_country_infos:
@@ -1424,8 +1518,8 @@ def _import_single_thread(
                             )
                         except sqlite3.Error as exc2:
                             log.debug(
-                                "Skipping place %s: %s",
-                                place.get("photon_id"), exc2,
+                                "Skipping place id=%s: %s",
+                                place.get("_place_id"), exc2,
                             )
 
             if pbar is not None:
@@ -1460,6 +1554,38 @@ def _import_single_thread(
 
 
 # ---------------------------------------------------------------------------
+# Public helpers
+# ---------------------------------------------------------------------------
+
+def load_tag_filter(path: str) -> Set[Tuple[Optional[str], Optional[str]]]:
+    """Load an OSM tag filter from a JSON file.
+
+    The file must contain a JSON array of objects with ``osm_key`` and an
+    optional ``osm_value`` field.  If ``osm_value`` is absent or null the
+    entry blocks all values for that key.
+
+    Example::
+
+        [
+            {"osm_key": "boundary", "osm_value": "administrative"},
+            {"osm_key": "landuse"}
+        ]
+    """
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+    if not isinstance(data, list):
+        raise ValueError(f"Tag filter file must be a JSON array: {path}")
+    result: Set[Tuple[Optional[str], Optional[str]]] = set()
+    for item in data:
+        if not isinstance(item, dict) or "osm_key" not in item:
+            continue
+        key = item["osm_key"] or None
+        value = item.get("osm_value") or None
+        result.add((key, value))
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Public import entry point
 # ---------------------------------------------------------------------------
 
@@ -1473,6 +1599,8 @@ def import_database(
     show_progress: bool = True,
     single_thread: bool = False,
     fetch_translations: bool = True,
+    tag_filter: Optional[Set[Tuple[Optional[str], Optional[str]]]] = None,
+    store_extra: bool = False,
 ) -> None:
     """Import a Photon JSONL(.zst) dump into *output_path*.
 
@@ -1483,9 +1611,23 @@ def import_database(
         ``openstreetmap-tag-translations`` project for each requested language
         and stored in the database.  Set to ``False`` to skip translation
         download (e.g. in offline or testing environments).
+    tag_filter:
+        Set of ``(osm_key, osm_value)`` pairs to skip during import.  Use
+        ``None`` as osm_value to block all values for a key.  Defaults to
+        ``_DEFAULT_TAG_FILTER`` when not provided.  Pass an empty set to
+        disable filtering entirely.
+    store_extra:
+        When ``True``, the ``extra`` JSON blob from each photon entry is
+        compressed and stored in ``places.extra``.  Defaults to ``False``
+        to save disk space.
     """
     if not languages:
         raise ValueError("At least one language must be specified.")
+
+    # Use the default tag filter when the caller does not supply one.
+    effective_filter: Set[Tuple[Optional[str], Optional[str]]] = (
+        _DEFAULT_TAG_FILTER if tag_filter is None else tag_filter
+    )
 
     # Download tag translations once before spawning workers.
     translations: Dict[str, Dict[str, str]] = {}
@@ -1507,6 +1649,8 @@ def import_database(
             batch_size=batch_size,
             show_progress=show_progress,
             translations=translations,
+            tag_filter=effective_filter,
+            store_extra=store_extra,
         )
         return
 
@@ -1541,14 +1685,15 @@ def import_database(
     for i in range(n_workers):
         p = mp.Process(
             target=_worker_main,
-            args=(
-                work_queue,
-                worker_db_paths[i],
-                languages,
-                poly_state,
-                i,
-                i * _PLACES_PER_WORKER,
-                translations,
+            kwargs=dict(
+                work_queue=work_queue,
+                db_path=worker_db_paths[i],
+                languages=languages,
+                poly_state=poly_state,
+                worker_id=i,
+                translations=translations,
+                tag_filter=effective_filter,
+                store_extra=store_extra,
             ),
             daemon=True,
         )
@@ -1591,7 +1736,8 @@ def import_database(
 
     if os.path.exists(output_path):
         os.unlink(output_path)
-    final_conn = create_database(output_path, languages=languages)
+    # Defer index creation until after all workers are merged.
+    final_conn = create_database(output_path, languages=languages, with_indexes=False)
 
     final_conn.execute("BEGIN")
     final_conn.execute(
@@ -1610,8 +1756,16 @@ def import_database(
         total_places += n
         log.info("  merged %d places (running total: %d)", n, total_places)
 
+    log.info("Creating indexes...")
+    from .schema import create_indexes
+    create_indexes(final_conn)
+
     log.info("Running ANALYZE...")
     final_conn.execute("ANALYZE")
+
+    log.info("Cleaning up orphaned data and compacting database...")
+    _cleanup_merged_db(final_conn)
+
     final_conn.close()
 
     for p in worker_db_paths:

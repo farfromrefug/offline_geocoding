@@ -421,13 +421,12 @@ def reverse(
     """
     conn, should_close = _conn(db)
     try:
-        min_lat = lat - radius_deg
-        max_lat = lat + radius_deg
-        min_lon = lon - radius_deg
-        max_lon = lon + radius_deg
-
         lat_int = round(lat * LAT_LON_SCALE)
         lon_int = round(lon * LAT_LON_SCALE)
+        min_lat_i = round((lat - radius_deg) * LAT_LON_SCALE)
+        max_lat_i = round((lat + radius_deg) * LAT_LON_SCALE)
+        min_lon_i = round((lon - radius_deg) * LAT_LON_SCALE)
+        max_lon_i = round((lon + radius_deg) * LAT_LON_SCALE)
 
         sql = """
             SELECT p.*,
@@ -441,8 +440,8 @@ def reverse(
         """
         params = (
             lat_int, lat_int, lon_int, lon_int,
-            max_lat, min_lat,
-            max_lon, min_lon,
+            max_lat_i, min_lat_i,
+            max_lon_i, min_lon_i,
             limit,
         )
 

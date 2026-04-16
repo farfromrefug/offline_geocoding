@@ -15,6 +15,7 @@ from offline_geocoding.importer import (
     _extract_addresses,
     _extract_names,
     _parse_category_parts,
+    _parse_photon_id,
     _parse_place_entry,
     import_database,
 )
@@ -146,13 +147,39 @@ def test_parse_place_entry_basic():
     # German name should be absent
     assert not any(l == "de" for _, l, _ in result["names"])
     assert result["categories"] == ["place.city"]
-    assert result["extra"] is not None  # gzip blob
+    # _place_id must equal the photon place_id integer
+    assert result["_place_id"] == 42
+    # extra is None by default (store_extra=False)
+    assert result["extra"] is None
 
     # bbox must NOT be present in the parsed result (removed from schema)
     assert "bbox_min_lon" not in result
     assert "bbox_max_lat" not in result
     # osm_type must NOT be present
     assert "osm_type" not in result
+
+
+def test_parse_place_entry_store_extra():
+    result = _parse_place_entry(SAMPLE_ENTRY, LANG_SET_EN_FR, None, store_extra=True)
+    assert result is not None
+    assert result["extra"] is not None  # gzip blob
+
+
+def test_parse_place_entry_no_place_id():
+    """Entries without a valid integer place_id are rejected."""
+    entry = {**SAMPLE_ENTRY}
+    entry.pop("place_id", None)
+    assert _parse_place_entry(entry, LANG_SET_EN_FR, None) is None
+
+
+def test_parse_photon_id():
+    from offline_geocoding.importer import _parse_photon_id
+    assert _parse_photon_id(42) == 42
+    assert _parse_photon_id(42.0) == 42
+    assert _parse_photon_id("123") == 123
+    assert _parse_photon_id("") is None
+    assert _parse_photon_id(None) is None
+    assert _parse_photon_id("abc") is None
 
 
 def test_parse_place_entry_no_centroid():
@@ -648,6 +675,7 @@ def test_rtree_centroid_constraint(tmp_path):
         num_workers=1,
         show_progress=False,
         fetch_translations=False,
+        tag_filter=set(),
     )
 
     conn = sqlite3.connect(db_path)
@@ -655,17 +683,16 @@ def test_rtree_centroid_constraint(tmp_path):
     assert count == 3, "All 3 places should be in the R-tree"
 
     # All R-tree entries must satisfy min_lat <= max_lat and min_lon <= max_lon.
+    # With rtree_i32, coordinates are large integers (×LAT_LON_SCALE); min == max.
     rows = conn.execute(
         "SELECT id, min_lat, max_lat, min_lon, max_lon FROM places_rtree"
     ).fetchall()
     for r in rows:
         assert r[1] <= r[2], f"R-tree constraint violated: min_lat={r[1]} > max_lat={r[2]}"
         assert r[3] <= r[4], f"R-tree constraint violated: min_lon={r[3]} > max_lon={r[4]}"
-        # With centroid-only storage, min ≈ max (within 32-bit float rounding;
-        # SQLite R-tree rounds min down and max up to preserve the containment
-        # guarantee, so they may differ by a tiny epsilon but will be very close).
-        assert abs(r[2] - r[1]) < 1e-5, f"min_lat and max_lat too far apart: {r[1]} vs {r[2]}"
-        assert abs(r[4] - r[3]) < 1e-5, f"min_lon and max_lon too far apart: {r[3]} vs {r[4]}"
+        # With centroid-only storage and rtree_i32, min == max exactly.
+        assert r[1] == r[2], f"rtree_i32: min_lat should equal max_lat; got {r[1]} vs {r[2]}"
+        assert r[3] == r[4], f"rtree_i32: min_lon should equal max_lon; got {r[3]} vs {r[4]}"
     conn.close()
 
 
@@ -673,7 +700,7 @@ def test_rtree_constraint_multi_worker(tmp_path):
     """R-tree constraint must hold after multi-worker merge."""
     entries = [
         {**PARIS_ENTRY, "place_id": i, "centroid": [2.3 + i * 0.01, 48.8 + i * 0.01]}
-        for i in range(6)
+        for i in range(1, 7)  # start at 1 to avoid place_id=0
     ]
     jsonl_path = _write_jsonl(tmp_path, entries)
     db_path = str(tmp_path / "geo_rtree_multi.db")
@@ -686,6 +713,7 @@ def test_rtree_constraint_multi_worker(tmp_path):
         batch_size=3,
         show_progress=False,
         fetch_translations=False,
+        tag_filter=set(),
     )
 
     conn = sqlite3.connect(db_path)
@@ -696,6 +724,9 @@ def test_rtree_constraint_multi_worker(tmp_path):
     for r in rows:
         assert r[1] <= r[2], f"Rtree min_lat > max_lat for id={r[0]}"
         assert r[3] <= r[4], f"Rtree min_lon > max_lon for id={r[0]}"
+        # rtree_i32: min == max for centroid storage
+        assert r[1] == r[2], f"rtree_i32: min_lat should equal max_lat for id={r[0]}"
+        assert r[3] == r[4], f"rtree_i32: min_lon should equal max_lon for id={r[0]}"
     conn.close()
 
 
@@ -811,7 +842,13 @@ def test_import_osm_tags_populated(tmp_path):
 
 
 def test_import_place_osm_tags_populated(tmp_path):
-    """place_osm_tags must link each place to its category token parts."""
+    """place_osm_tags must link each place to EXTRA category token parts only.
+    Tokens that duplicate osm_key_id / osm_value_id are excluded from
+    place_osm_tags (they are already in places.osm_key_id/osm_value_id).
+    """
+    # Use an entry with a category whose tokens DO match osm_key/value.
+    # Paris: osm_key="place", osm_value="city", category="place.city"
+    # → tokens "place" (= osm_key_id) and "city" (= osm_value_id): both skipped.
     jsonl_path = _write_jsonl(tmp_path, [PARIS_ENTRY])
     db_path = str(tmp_path / "geo_pot.db")
 
@@ -822,6 +859,63 @@ def test_import_place_osm_tags_populated(tmp_path):
         num_workers=1,
         show_progress=False,
         fetch_translations=False,
+        tag_filter=set(),  # no filtering
+    )
+
+    conn = sqlite3.connect(db_path)
+
+    # Paris has only "place.city" → all tokens match key/value → place_osm_tags empty.
+    rows = conn.execute(
+        """
+        SELECT ot.token, ot.ctx
+        FROM place_osm_tags pot
+        JOIN osm_tags ot ON ot.id = pot.tag_id
+        WHERE pot.place_id = (SELECT id FROM places LIMIT 1)
+        """
+    ).fetchall()
+    ctxs = {r[1] for r in rows}
+    # Tokens that are already in osm_key_id/osm_value_id must NOT be in place_osm_tags.
+    assert "place" not in ctxs, "osm_key token should NOT be in place_osm_tags"
+    assert "place=city" not in ctxs, "osm_value token should NOT be in place_osm_tags"
+
+    # The tokens ARE still accessible via the places table directly.
+    row = conn.execute(
+        """
+        SELECT tk.ctx, tv.ctx
+        FROM places p
+        JOIN osm_tags tk ON tk.id = p.osm_key_id
+        JOIN osm_tags tv ON tv.id = p.osm_value_id
+        """
+    ).fetchone()
+    assert row is not None
+    assert row[0] == "place"
+    assert row[1] == "place=city"
+    conn.close()
+
+
+def test_import_place_osm_tags_extra_tokens(tmp_path):
+    """place_osm_tags must contain tokens from multi-part categories that are
+    NOT already covered by osm_key_id / osm_value_id.
+    """
+    # Use a 3-part category where the first token is "extra".
+    entry = {
+        **PARIS_ENTRY,
+        "place_id": 99,
+        "osm_key": "amenity",
+        "osm_value": "restaurant",
+        "categories": ["food.amenity.restaurant"],
+    }
+    jsonl_path = _write_jsonl(tmp_path, [entry])
+    db_path = str(tmp_path / "geo_pot_extra.db")
+
+    import_database(
+        input_path=jsonl_path,
+        output_path=db_path,
+        languages=["en"],
+        num_workers=1,
+        show_progress=False,
+        fetch_translations=False,
+        tag_filter=set(),  # no filtering
     )
 
     conn = sqlite3.connect(db_path)
@@ -834,10 +928,13 @@ def test_import_place_osm_tags_populated(tmp_path):
         """
     ).fetchall()
     ctxs = {r[1] for r in rows}
-
-    # Paris has category "place.city" -> tokens "place" and "city"
-    assert "place" in ctxs
-    assert "place=city" in ctxs
+    tokens = {r[0] for r in rows}
+    # "food" and "food=amenity" are extra tokens (not key/value) → should be present.
+    assert "food" in ctxs or "food" in tokens, \
+        f"Extra token 'food' should be in place_osm_tags; got ctxs={ctxs}"
+    # "amenity" and "amenity=restaurant" match key/value → must NOT be present.
+    assert "amenity" not in ctxs, "osm_key 'amenity' token must not be in place_osm_tags"
+    assert "amenity=restaurant" not in ctxs, "osm_value token must not be in place_osm_tags"
     conn.close()
 
 
@@ -1005,3 +1102,244 @@ def test_import_fts_includes_category_tokens_multi_worker(tmp_path):
     results2 = search(db_path, "city", languages=["en"])
     assert len(results2) > 0
     assert any("Paris" in r["name"] for r in results2)
+
+
+# ---------------------------------------------------------------------------
+# store_extra tests
+# ---------------------------------------------------------------------------
+
+def test_import_store_extra_false(tmp_path):
+    """When store_extra is not set (default False), places.extra must be NULL."""
+    jsonl_path = _write_jsonl(tmp_path, [PARIS_ENTRY])
+    db_path = str(tmp_path / "geo_no_extra.db")
+
+    import_database(
+        input_path=jsonl_path,
+        output_path=db_path,
+        languages=["en"],
+        num_workers=1,
+        show_progress=False,
+        fetch_translations=False,
+        # store_extra defaults to False — do not pass it explicitly
+    )
+
+    conn = sqlite3.connect(db_path)
+    row = conn.execute("SELECT extra FROM places LIMIT 1").fetchone()
+    assert row is not None
+    assert row[0] is None, "extra must be NULL when store_extra=False"
+    conn.close()
+
+
+def test_import_store_extra_true(tmp_path):
+    """When store_extra=True, places.extra is a non-NULL gzip blob."""
+    # Use the SAMPLE_ENTRY which has an 'extra' field.
+    entry = {
+        **PARIS_ENTRY,
+        "extra": {"wikipedia": "fr:Paris", "rank": 1},
+    }
+    jsonl_path = _write_jsonl(tmp_path, [entry])
+    db_path = str(tmp_path / "geo_extra.db")
+
+    import_database(
+        input_path=jsonl_path,
+        output_path=db_path,
+        languages=["en"],
+        num_workers=1,
+        show_progress=False,
+        fetch_translations=False,
+        store_extra=True,
+    )
+
+    conn = sqlite3.connect(db_path)
+    row = conn.execute("SELECT extra FROM places LIMIT 1").fetchone()
+    assert row is not None
+    assert row[0] is not None, "extra must be a non-NULL blob when store_extra=True"
+    # Must be a valid gzip blob.
+    import gzip, json as _json
+    decoded = _json.loads(gzip.decompress(row[0]))
+    assert decoded.get("wikipedia") == "fr:Paris"
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# tag_filter tests
+# ---------------------------------------------------------------------------
+
+def test_import_tag_filter_blocks_entry(tmp_path):
+    """Places whose (osm_key, osm_value) match the tag_filter are skipped."""
+    # Place that would normally be imported.
+    blocked_entry = {
+        **PARIS_ENTRY,
+        "place_id": 200,
+        "osm_key": "boundary",
+        "osm_value": "administrative",
+    }
+    jsonl_path = _write_jsonl(tmp_path, [PARIS_ENTRY, blocked_entry])
+    db_path = str(tmp_path / "geo_filtered.db")
+
+    import_database(
+        input_path=jsonl_path,
+        output_path=db_path,
+        languages=["en"],
+        num_workers=1,
+        show_progress=False,
+        fetch_translations=False,
+        tag_filter={("boundary", "administrative")},
+    )
+
+    conn = sqlite3.connect(db_path)
+    count = conn.execute("SELECT COUNT(*) FROM places").fetchone()[0]
+    assert count == 1, f"Blocked entry must be skipped; got {count} places"
+    row = conn.execute(
+        """
+        SELECT ot.token FROM places p
+        JOIN osm_tags ot ON ot.id = p.osm_key_id
+        """
+    ).fetchone()
+    assert row is not None
+    assert row[0] == "place"  # Only Paris (place.city) was imported
+    conn.close()
+
+
+def test_import_empty_tag_filter(tmp_path):
+    """An empty tag_filter set disables all filtering."""
+    entry = {
+        **PARIS_ENTRY,
+        "place_id": 300,
+        "osm_key": "boundary",
+        "osm_value": "administrative",
+    }
+    jsonl_path = _write_jsonl(tmp_path, [PARIS_ENTRY, entry])
+    db_path = str(tmp_path / "geo_no_filter.db")
+
+    import_database(
+        input_path=jsonl_path,
+        output_path=db_path,
+        languages=["en"],
+        num_workers=1,
+        show_progress=False,
+        fetch_translations=False,
+        tag_filter=set(),  # explicitly disable filtering
+    )
+
+    conn = sqlite3.connect(db_path)
+    count = conn.execute("SELECT COUNT(*) FROM places").fetchone()[0]
+    assert count == 2, f"Both entries should be imported with empty filter; got {count}"
+    conn.close()
+
+
+def test_import_default_tag_filter(tmp_path):
+    """The built-in default tag_filter blocks boundary=administrative."""
+    entries = [
+        PARIS_ENTRY,
+        {
+            **PARIS_ENTRY,
+            "place_id": 400,
+            "osm_key": "boundary",
+            "osm_value": "administrative",
+        },
+    ]
+    jsonl_path = _write_jsonl(tmp_path, entries)
+    db_path = str(tmp_path / "geo_default_filter.db")
+
+    import_database(
+        input_path=jsonl_path,
+        output_path=db_path,
+        languages=["en"],
+        num_workers=1,
+        show_progress=False,
+        fetch_translations=False,
+        # tag_filter=None → use _DEFAULT_TAG_FILTER
+    )
+
+    conn = sqlite3.connect(db_path)
+    count = conn.execute("SELECT COUNT(*) FROM places").fetchone()[0]
+    assert count == 1, "boundary=administrative should be blocked by default filter"
+    conn.close()
+
+
+def test_load_tag_filter(tmp_path):
+    """load_tag_filter parses a JSON file into the expected set."""
+    from offline_geocoding.importer import load_tag_filter
+    filter_file = tmp_path / "filter.json"
+    filter_file.write_text(
+        '[{"osm_key": "boundary", "osm_value": "administrative"}, {"osm_key": "landuse"}]'
+    )
+    result = load_tag_filter(str(filter_file))
+    assert ("boundary", "administrative") in result
+    assert ("landuse", None) in result
+
+
+# ---------------------------------------------------------------------------
+# photon_id-as-place-id tests
+# ---------------------------------------------------------------------------
+
+def test_import_photon_id_as_place_id(tmp_path):
+    """places.id must equal the photon place_id integer."""
+    jsonl_path = _write_jsonl(tmp_path, [PARIS_ENTRY, EIFFEL_ENTRY])
+    db_path = str(tmp_path / "geo_pid.db")
+
+    import_database(
+        input_path=jsonl_path,
+        output_path=db_path,
+        languages=["en"],
+        num_workers=1,
+        show_progress=False,
+        fetch_translations=False,
+        tag_filter=set(),
+    )
+
+    conn = sqlite3.connect(db_path)
+    ids = {r[0] for r in conn.execute("SELECT id FROM places").fetchall()}
+    # PARIS_ENTRY has place_id=1, EIFFEL_ENTRY has place_id=2
+    assert 1 in ids
+    assert 2 in ids
+    conn.close()
+
+
+def test_import_duplicate_photon_id_deduped(tmp_path):
+    """Duplicate photon_ids are silently deduplicated (INSERT OR IGNORE)."""
+    # Two entries with the same place_id=1 — only one should appear in DB.
+    entry_a = {**PARIS_ENTRY, "place_id": 1}
+    entry_b = {**EIFFEL_ENTRY, "place_id": 1}  # same place_id!
+    jsonl_path = _write_jsonl(tmp_path, [entry_a, entry_b])
+    db_path = str(tmp_path / "geo_dedup.db")
+
+    import_database(
+        input_path=jsonl_path,
+        output_path=db_path,
+        languages=["en"],
+        num_workers=1,
+        show_progress=False,
+        fetch_translations=False,
+        tag_filter=set(),
+    )
+
+    conn = sqlite3.connect(db_path)
+    count = conn.execute("SELECT COUNT(*) FROM places").fetchone()[0]
+    assert count == 1, f"Duplicate photon_id must be deduplicated; got {count}"
+    conn.close()
+
+
+def test_import_no_photon_id_skipped(tmp_path):
+    """Entries without a valid integer place_id are skipped."""
+    entry = {**PARIS_ENTRY}
+    entry.pop("place_id", None)
+    jsonl_path = _write_jsonl(tmp_path, [entry, EIFFEL_ENTRY])
+    db_path = str(tmp_path / "geo_nopid.db")
+
+    import_database(
+        input_path=jsonl_path,
+        output_path=db_path,
+        languages=["en"],
+        num_workers=1,
+        show_progress=False,
+        fetch_translations=False,
+        tag_filter=set(),
+    )
+
+    conn = sqlite3.connect(db_path)
+    count = conn.execute("SELECT COUNT(*) FROM places").fetchone()[0]
+    # Only EIFFEL_ENTRY (which has place_id=2) should be imported.
+    assert count == 1
+    conn.close()

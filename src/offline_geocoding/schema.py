@@ -7,9 +7,10 @@ Design Goals
   their own temporary database; a SQL-driven merge step deduplicates across
   workers using temp mapping tables.
 * **Compact storage** – shared ``strings`` table means "Paris" is stored once
-  even if thousands of places reference it as a city or name.  ``langs``,
-  ``name_kinds``, and ``addr_types`` are tiny lookup tables whose IDs replace
-  repeated TEXT columns throughout the schema.
+  even if thousands of places reference it as a city or name.  ``langs`` and
+  ``addr_types`` are tiny lookup tables whose IDs replace repeated TEXT
+  columns.  ``place_names.kind_id`` uses the fixed ``NAME_KIND_IDS`` mapping
+  without a backing lookup table.
 * **Language-aware queries** – all name/address variants stored as rows in
   ``place_names`` / ``place_addresses`` with ``lang_id`` referencing the
   ``langs`` table.  Country names stored in ``country_names`` the same way.
@@ -22,21 +23,24 @@ Design Goals
 
 Normalisation rules
 -------------------
-* ``langs`` / ``name_kinds`` / ``addr_types`` are **pre-seeded** at database
-  creation time with fixed IDs from the constants ``NAME_KIND_IDS`` and
-  ``ADDR_TYPE_IDS``.  ``langs`` gets IDs assigned from sorted({"default"} |
-  user_languages).  Because all worker databases and the final database are
-  created with the same language list and the same pre-seeded tables, their
-  IDs are **always identical** — no remapping is needed for these tables
-  during the merge step.
+* ``places.id`` equals the Photon/Nominatim ``place_id`` (an integer).  This
+  means IDs are globally unique across worker databases — no ``_pmap``
+  remapping is needed during the merge step, and the same photon_id in
+  different workers is automatically deduplicated via ``INSERT OR IGNORE``.
+* ``langs`` and ``addr_types`` are **pre-seeded** at database creation time
+  with fixed IDs from ``ADDR_TYPE_IDS`` and ``build_lang_ids``.  Because all
+  worker databases and the final database are created with the same language
+  list, these IDs are **always identical** — no remapping is needed.
+* ``place_names.kind_id`` uses the hardcoded ``NAME_KIND_IDS`` mapping (1–7);
+  there is no ``name_kinds`` lookup table.
 * ``strings`` (via ``_smap``), ``categories`` (via ``_cmap``), and
-  ``osm_tags`` (via ``_tmap``) need ID remapping during merge.
+  ``osm_tags`` (via ``_tmap``) still need ID remapping during merge because
+  they use local AUTOINCREMENT IDs in each worker.
 
 Tables (final database)
 -----------------------
 metadata         – key/value store for import settings
 langs            – interned language codes; INTEGER PK, pre-seeded
-name_kinds       – interned name-kind strings ('name', 'alt', ...); pre-seeded
 addr_types       – interned address-type strings ('city', 'country', ...); pre-seeded
 strings          – interned text values; INTEGER PRIMARY KEY (AUTOINCREMENT)
 categories       – interned OSM category strings; INTEGER PRIMARY KEY
@@ -44,13 +48,14 @@ osm_tags         – interned OSM tag tokens; id PK, token TEXT, ctx TEXT UNIQUE
 osm_tag_names    – localised labels for tag tokens; references osm_tags + strings + langs
 countries        – ISO country codes keyed by ``code TEXT PRIMARY KEY``
 country_names    – localised country names; references strings + langs
-places           – one row per photon place entry; normalised columns
+places           – one row per photon place entry; id = photon/nominatim place_id
 place_names      – N:M place ↔ string with lang_id + kind_id columns
 place_addresses  – N:M place ↔ string with addr_type_id + lang_id columns
 place_categories – N:M place ↔ category
-place_osm_tags   – N:M place ↔ osm_tag (all tokens from split categories)
+place_osm_tags   – N:M place ↔ osm_tag (extra category tokens only, not key/value)
 places_fts       – FTS5 contentless virtual table, trigram tokeniser
-places_rtree     – R-tree spatial index; stores centroid as (min==max) point
+places_rtree     – R-tree spatial index (rtree_i32); centroid stored as integer
+                   (×LAT_LON_SCALE), min==max for both lat and lon
 
 Worker databases (temporary, one per worker process)
 -----------------------------------------------------
@@ -163,13 +168,6 @@ CREATE TABLE IF NOT EXISTS langs (
     code TEXT UNIQUE NOT NULL
 );
 
--- Interned name-kind strings ('name', 'alt', 'old', ...).
--- Pre-seeded with fixed IDs from NAME_KIND_IDS.
-CREATE TABLE IF NOT EXISTS name_kinds (
-    id   INTEGER PRIMARY KEY,
-    kind TEXT UNIQUE NOT NULL
-);
-
 -- Interned address-type strings ('country', 'city', 'street', ...).
 -- Pre-seeded with fixed IDs from ADDR_TYPE_IDS.
 CREATE TABLE IF NOT EXISTS addr_types (
@@ -238,11 +236,13 @@ CREATE TABLE IF NOT EXISTS country_names (
 -- foreign keys wherever the cardinality is bounded.
 -- ``importance`` stored as round(value * IMPORTANCE_SCALE) (INTEGER).
 -- ``lat`` / ``lon`` stored as round(degrees * LAT_LON_SCALE) (INTEGER).
+-- ``id`` is the Photon/Nominatim place_id — a globally unique integer that
+--    is stable across worker databases, eliminating the need for _pmap remapping.
 -- ``osm_key_id`` / ``osm_value_id`` reference osm_tags(id), NOT strings(id).
 -- They share the same interning table as split category parts.
+-- ``extra`` is an optional gzip-compressed JSON blob; NULL when not stored.
 CREATE TABLE IF NOT EXISTS places (
     id           INTEGER PRIMARY KEY,
-    photon_id    TEXT,
     osm_id       INTEGER,
     osm_key_id   INTEGER REFERENCES osm_tags(id),
     osm_value_id INTEGER REFERENCES osm_tags(id),
@@ -257,12 +257,13 @@ CREATE TABLE IF NOT EXISTS places (
 );
 
 -- Multilingual names for a place.
--- lang_id → langs(id); kind_id → name_kinds(id).
+-- lang_id  → langs(id).
+-- kind_id  → NAME_KIND_IDS constant (no backing name_kinds table needed).
 CREATE TABLE IF NOT EXISTS place_names (
     place_id  INTEGER NOT NULL REFERENCES places(id)     ON DELETE CASCADE,
     string_id INTEGER NOT NULL REFERENCES strings(id),
     lang_id   INTEGER NOT NULL REFERENCES langs(id),
-    kind_id   INTEGER NOT NULL REFERENCES name_kinds(id),
+    kind_id   INTEGER NOT NULL,
     PRIMARY KEY (place_id, string_id, lang_id, kind_id)
 );
 
@@ -283,8 +284,10 @@ CREATE TABLE IF NOT EXISTS place_categories (
     PRIMARY KEY (place_id, category_id)
 );
 
--- OSM tag tokens assigned to a place (from split category parts).
--- Enables efficient "filter by tag token" queries and drives FTS indexing.
+-- OSM tag tokens assigned to a place from split category parts.
+-- Only contains tokens that are NOT already stored as osm_key_id / osm_value_id
+-- in the places table — those are already there and would be redundant here.
+-- Enables efficient "filter by extra category token" queries.
 CREATE TABLE IF NOT EXISTS place_osm_tags (
     place_id INTEGER NOT NULL REFERENCES places(id)  ON DELETE CASCADE,
     tag_id   INTEGER NOT NULL REFERENCES osm_tags(id),
@@ -329,9 +332,13 @@ CREATE VIRTUAL TABLE IF NOT EXISTS places_fts USING fts5(
 """
 
 # R-tree virtual table for fast bounding-box reverse geocoding.
-# Centroid stored as a degenerate box: min_lat == max_lat, min_lon == max_lon.
+# Uses ``rtree_i32`` so that coordinates are stored as 32-bit signed integers
+# rather than 64-bit doubles.  Centroid stored as a degenerate box:
+# min_lat == max_lat, min_lon == max_lon (same scaled value as places.lat/lon).
+# This halves the per-entry coordinate storage cost and preserves full integer
+# precision at LAT_LON_SCALE (≈ 0.1 m resolution at the equator).
 _RTREE = """
-CREATE VIRTUAL TABLE IF NOT EXISTS places_rtree USING rtree(
+CREATE VIRTUAL TABLE IF NOT EXISTS places_rtree USING rtree_i32(
     id,
     min_lat, max_lat,
     min_lon, max_lon
@@ -342,7 +349,6 @@ _INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_places_country    ON places(country_code);
 CREATE INDEX IF NOT EXISTS idx_places_osm        ON places(osm_id);
 CREATE INDEX IF NOT EXISTS idx_places_importance ON places(importance DESC);
-CREATE INDEX IF NOT EXISTS idx_places_photon_id  ON places(photon_id);
 CREATE INDEX IF NOT EXISTS idx_place_names_place ON place_names(place_id);
 CREATE INDEX IF NOT EXISTS idx_place_names_lang  ON place_names(lang_id, kind_id);
 CREATE INDEX IF NOT EXISTS idx_place_addr_place  ON place_addresses(place_id);
@@ -373,21 +379,18 @@ def _seed_fixed_tables(
     conn: sqlite3.Connection,
     languages: Sequence[str],
 ) -> None:
-    """Pre-seed ``langs``, ``name_kinds``, and ``addr_types`` with fixed IDs.
+    """Pre-seed ``langs`` and ``addr_types`` with fixed IDs.
 
     Safe to call multiple times (``INSERT OR IGNORE``).  Must be called
     inside an active transaction or with autocommit.
+
+    Note: there is no ``name_kinds`` table — ``place_names.kind_id`` uses the
+    hardcoded ``NAME_KIND_IDS`` mapping directly.
     """
     # langs: sorted({"default"} | set(languages)), IDs start at 1.
     for code, lid in build_lang_ids(languages).items():
         conn.execute(
             "INSERT OR IGNORE INTO langs(id, code) VALUES (?, ?)", (lid, code)
-        )
-
-    # name_kinds: fixed mapping from NAME_KIND_IDS.
-    for kind, kid in NAME_KIND_IDS.items():
-        conn.execute(
-            "INSERT OR IGNORE INTO name_kinds(id, kind) VALUES (?, ?)", (kid, kind)
         )
 
     # addr_types: fixed mapping from ADDR_TYPE_IDS.

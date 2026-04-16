@@ -167,6 +167,28 @@ def main() -> None:
         "or want predictable, reproducible behaviour."
     ),
 )
+@click.option(
+    "--store-extra",
+    is_flag=True,
+    default=False,
+    help=(
+        "Store the 'extra' JSON blob (tags, wikipedia links, etc.) from each "
+        "place in the database.  Significantly increases database size.  "
+        "Disabled by default."
+    ),
+)
+@click.option(
+    "--tag-filter",
+    "tag_filter_path",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False, readable=True),
+    help=(
+        "Path to a JSON file specifying OSM tag combinations to skip during "
+        "import.  File must be a JSON array of objects with 'osm_key' and "
+        "optional 'osm_value' fields.  When not specified a built-in default "
+        "filter is applied.  Pass an empty array file to disable filtering."
+    ),
+)
 def cmd_import(
     input_path: str,
     output_path: str,
@@ -176,6 +198,8 @@ def cmd_import(
     batch_size: int,
     verbose: bool,
     single_thread: bool,
+    store_extra: bool,
+    tag_filter_path: Optional[str],
 ) -> None:
     """Import a Photon JSONL(.zst) dump into a geocoding SQLite database."""
     _setup_logging(verbose)
@@ -187,7 +211,15 @@ def cmd_import(
     if poly_file:
         click.echo(f"  poly filter: {poly_file}")
 
-    from .importer import import_database
+    from .importer import import_database, load_tag_filter, _DEFAULT_TAG_FILTER
+
+    tag_filter = None
+    if tag_filter_path is not None:
+        tag_filter = load_tag_filter(tag_filter_path)
+        click.echo(f"  tag filter: {tag_filter_path} ({len(tag_filter)} rules)")
+    else:
+        tag_filter = _DEFAULT_TAG_FILTER
+        click.echo(f"  tag filter: built-in default ({len(tag_filter)} rules)")
 
     import_database(
         input_path=input_path,
@@ -198,6 +230,8 @@ def cmd_import(
         batch_size=batch_size,
         show_progress=True,
         single_thread=single_thread,
+        tag_filter=tag_filter,
+        store_extra=store_extra,
     )
     click.echo("Done.")
 
