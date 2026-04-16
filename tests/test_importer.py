@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import gzip
 import json
 import os
 import sqlite3
@@ -18,7 +17,13 @@ from offline_geocoding.importer import (
     _parse_place_entry,
     import_database,
 )
-from offline_geocoding.schema import create_database, create_worker_database
+from offline_geocoding.schema import (
+    ADDR_TYPE_IDS,
+    NAME_KIND_IDS,
+    build_lang_ids,
+    create_database,
+    create_worker_database,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +147,12 @@ def test_parse_place_entry_basic():
     assert result["categories"] == ["place.city"]
     assert result["extra"] is not None  # gzip blob
 
+    # bbox must NOT be present in the parsed result (removed from schema)
+    assert "bbox_min_lon" not in result
+    assert "bbox_max_lat" not in result
+    # osm_type must NOT be present
+    assert "osm_type" not in result
+
 
 def test_parse_place_entry_no_centroid():
     entry = {**SAMPLE_ENTRY, "centroid": None}
@@ -152,11 +163,9 @@ def test_parse_place_entry_poly_filter_outside():
     """Place outside poly filter is rejected."""
     from offline_geocoding.poly_filter import PolyFilter
 
-    # Small polygon around (0,0)→(1,1)
     pf = PolyFilter([
         ([(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)], False)
     ])
-    # Paris centroid is outside this box.
     assert _parse_place_entry(SAMPLE_ENTRY, LANG_SET_EN_FR, pf) is None
 
 
@@ -164,23 +173,11 @@ def test_parse_place_entry_poly_filter_inside():
     """Place inside poly filter is accepted."""
     from offline_geocoding.poly_filter import PolyFilter
 
-    # Polygon covering Paris roughly.
     pf = PolyFilter([
         ([(2.0, 48.5), (3.0, 48.5), (3.0, 49.2), (2.0, 49.2)], False)
     ])
     result = _parse_place_entry(SAMPLE_ENTRY, LANG_SET_EN_FR, pf)
     assert result is not None
-
-
-def test_parse_place_entry_no_bbox_fallback():
-    """When bbox is missing, centroid is used as point bbox."""
-    entry = {**SAMPLE_ENTRY}
-    entry.pop("bbox", None)
-    entry["bbox"] = None
-    result = _parse_place_entry(entry, LANG_SET_EN_FR, None)
-    assert result is not None
-    assert result["bbox_min_lon"] == result["bbox_max_lon"] == result["lon"]
-    assert result["bbox_min_lat"] == result["bbox_max_lat"] == result["lat"]
 
 
 # ---------------------------------------------------------------------------
@@ -306,13 +303,14 @@ def test_import_language_filter(tmp_path):
     )
 
     conn = sqlite3.connect(db_path)
-    # Should have 'default' and 'en' names, but not 'fr'.
+    # Should have 'default' and 'en' lang codes, but not 'fr'.
+    # Join place_names with langs to get the code.
     rows = conn.execute(
-        "SELECT pn.lang FROM place_names pn"
+        "SELECT l.code FROM place_names pn JOIN langs l ON l.id = pn.lang_id"
     ).fetchall()
-    langs = {r[0] for r in rows}
-    assert "fr" not in langs
-    assert "en" in langs or "default" in langs
+    lang_codes = {r[0] for r in rows}
+    assert "fr" not in lang_codes
+    assert "en" in lang_codes or "default" in lang_codes
     conn.close()
 
 
@@ -352,7 +350,6 @@ END
 
 def test_import_no_duplicate_strings(tmp_path):
     """The same string appearing in multiple places is deduplicated."""
-    # Two places sharing the same city name.
     entry2 = {**EIFFEL_ENTRY, "place_id": 3, "address": {"city": "Paris", "country": "France"}}
     jsonl_path = _write_jsonl(tmp_path, [PARIS_ENTRY, entry2])
     db_path = str(tmp_path / "geo_dedup.db")
@@ -376,7 +373,6 @@ def test_import_no_duplicate_strings(tmp_path):
 
 def test_import_no_duplicate_strings_multi_worker(tmp_path):
     """Strings are globally deduplicated even across multiple workers."""
-    # Three places all sharing "Paris" and "France" strings.
     entry3 = {
         **EIFFEL_ENTRY,
         "place_id": 3,
@@ -397,18 +393,16 @@ def test_import_no_duplicate_strings_multi_worker(tmp_path):
         output_path=db_path,
         languages=["en", "fr"],
         num_workers=2,
-        batch_size=2,  # Small batch to force both workers to get data
+        batch_size=2,
         show_progress=False,
     )
 
     conn = sqlite3.connect(db_path)
-    # No string should appear more than once after the merge.
     dups = conn.execute(
         "SELECT value, COUNT(*) as c FROM strings GROUP BY value HAVING c > 1"
     ).fetchall()
     assert len(dups) == 0, f"Duplicate strings after multi-worker import: {[r[0] for r in dups]}"
 
-    # All places imported.
     count = conn.execute("SELECT COUNT(*) FROM places").fetchone()[0]
     assert count == 4
     conn.close()
@@ -439,16 +433,7 @@ def test_import_metadata(tmp_path):
 def test_import_place_without_country_info(tmp_path):
     """Places whose country_code is not covered by a CountryInfo record must
     still be imported (no FK constraint failure).
-
-    This simulates the common multi-worker case where one worker receives a
-    Place batch referencing a country code that was never delivered in a
-    CountryInfo batch to that same worker.
     """
-    # Build a dump with ONLY a Place (no CountryInfo), so the worker's
-    # countries table starts empty when the place is inserted.
-    lines = []
-    lines.append(json.dumps(PARIS_ENTRY))  # raw place entry (not wrapped)
-    # Wrap it properly as a Place message.
     dump_bytes = (
         json.dumps({"type": "Place", "content": [PARIS_ENTRY]}) + "\n"
     ).encode("utf-8")
@@ -467,7 +452,6 @@ def test_import_place_without_country_info(tmp_path):
     conn = sqlite3.connect(db_path)
     count = conn.execute("SELECT COUNT(*) FROM places").fetchone()[0]
     assert count == 1, "Place with unknown country_code should still be imported"
-    # A placeholder country row should have been created.
     cc = conn.execute(
         "SELECT COUNT(*) FROM countries WHERE code = 'fr'"
     ).fetchone()[0]
@@ -527,12 +511,10 @@ def test_schema_integer_lat_lon_importance(tmp_path):
     conn = sqlite3.connect(db_path)
     row = conn.execute("SELECT lat, lon, importance FROM places LIMIT 1").fetchone()
 
-    # Verify storage types.
     assert isinstance(row[0], int), "lat must be INTEGER"
     assert isinstance(row[1], int), "lon must be INTEGER"
     assert isinstance(row[2], int), "importance must be INTEGER"
 
-    # Verify values round-trip correctly.
     assert abs(row[0] / LAT_LON_SCALE - 48.8566) < 1e-5
     assert abs(row[1] / LAT_LON_SCALE - 2.3522) < 1e-5
     assert abs(row[2] / IMPORTANCE_SCALE - 0.8) < 1e-3
@@ -540,8 +522,8 @@ def test_schema_integer_lat_lon_importance(tmp_path):
     conn.close()
 
 
-def test_import_country_names_language(tmp_path):
-    """Country names are stored in the countries table with language keys."""
+def test_import_country_names_in_strings(tmp_path):
+    """Country names are stored in country_names table (not as gzip blobs)."""
     jsonl_path = _write_jsonl(tmp_path, [PARIS_ENTRY])
     db_path = str(tmp_path / "geo_cn.db")
 
@@ -553,15 +535,179 @@ def test_import_country_names_language(tmp_path):
         show_progress=False,
     )
 
-    import gzip as _gzip
     conn = sqlite3.connect(db_path)
-    row = conn.execute("SELECT names FROM countries WHERE code = 'fr'").fetchone()
-    assert row is not None
-    names_blob = row[0]
-    assert isinstance(names_blob, bytes) and len(names_blob) > 0
-    names = json.loads(_gzip.decompress(names_blob).decode())
-    # Should have 'en', 'fr', and 'default' entries.
-    assert "en" in names or "default" in names
-    assert "fr" in names
+    conn.row_factory = sqlite3.Row
+
+    # country_names should have entries for 'fr'.
+    rows = conn.execute(
+        """
+        SELECT s.value, l.code AS lang
+        FROM country_names cn
+        JOIN strings s ON s.id = cn.string_id
+        JOIN langs l   ON l.id = cn.lang_id
+        WHERE cn.code = 'fr'
+        """
+    ).fetchall()
+    assert len(rows) > 0, "country_names should have entries for 'fr'"
+
+    lang_to_name = {r["lang"]: r["value"] for r in rows}
+    # Should have at least the 'default' or 'en' entry.
+    assert "default" in lang_to_name or "en" in lang_to_name
+    # "France" should be the name.
+    assert any("France" in v for v in lang_to_name.values())
     conn.close()
 
+
+def test_import_places_use_string_ids(tmp_path):
+    """osm_key_id, osm_value_id, postcode_id, hn_id must be integer references to strings."""
+    jsonl_path = _write_jsonl(tmp_path, [PARIS_ENTRY])
+    db_path = str(tmp_path / "geo_ids.db")
+
+    import_database(
+        input_path=jsonl_path,
+        output_path=db_path,
+        languages=["en"],
+        num_workers=1,
+        show_progress=False,
+    )
+
+    conn = sqlite3.connect(db_path)
+    col_names = [
+        r[1] for r in conn.execute("PRAGMA table_info(places)").fetchall()
+    ]
+    # Must have integer ID columns, not text columns.
+    assert "osm_key_id" in col_names
+    assert "osm_value_id" in col_names
+    assert "addr_type_id" in col_names
+    assert "postcode_id" in col_names
+    assert "hn_id" in col_names
+    # Must NOT have old text columns.
+    for removed in ("osm_key", "osm_value", "address_type", "postcode", "housenumber"):
+        assert removed not in col_names
+
+    # osm_key_id should resolve via strings table.
+    row = conn.execute(
+        """
+        SELECT s.value
+        FROM places p JOIN strings s ON s.id = p.osm_key_id
+        LIMIT 1
+        """
+    ).fetchone()
+    assert row is not None
+    assert row[0] == "place"  # Paris has osm_key = 'place'
+    conn.close()
+
+
+def test_rtree_centroid_constraint(tmp_path):
+    """R-tree entries must always satisfy min_lat <= max_lat (centroid as point)."""
+    # Use entries that previously triggered the constraint violation:
+    # swapped or equal bounding boxes.
+    entries = [
+        # Entry with inverted bbox (would have failed with old bbox-based R-tree).
+        {
+            **PARIS_ENTRY,
+            "place_id": 10,
+            "centroid": [2.35, 48.85],
+            "bbox": [2.470, 48.901, 2.224, 48.815],  # deliberately swapped
+        },
+        # Entry with zero-area bbox.
+        {
+            **EIFFEL_ENTRY,
+            "place_id": 11,
+            "centroid": [2.2945, 48.8584],
+            "bbox": [2.2945, 48.8584, 2.2945, 48.8584],  # point bbox
+        },
+        # Entry with no bbox at all.
+        {
+            **PARIS_ENTRY,
+            "place_id": 12,
+            "centroid": [2.30, 48.86],
+            "bbox": None,
+        },
+    ]
+    jsonl_path = _write_jsonl(tmp_path, entries)
+    db_path = str(tmp_path / "geo_rtree.db")
+
+    # Must not raise sqlite3.IntegrityError.
+    import_database(
+        input_path=jsonl_path,
+        output_path=db_path,
+        languages=["en"],
+        num_workers=1,
+        show_progress=False,
+    )
+
+    conn = sqlite3.connect(db_path)
+    count = conn.execute("SELECT COUNT(*) FROM places_rtree").fetchone()[0]
+    assert count == 3, "All 3 places should be in the R-tree"
+
+    # All R-tree entries must satisfy min_lat <= max_lat and min_lon <= max_lon.
+    rows = conn.execute(
+        "SELECT id, min_lat, max_lat, min_lon, max_lon FROM places_rtree"
+    ).fetchall()
+    for r in rows:
+        assert r[1] <= r[2], f"R-tree constraint violated: min_lat={r[1]} > max_lat={r[2]}"
+        assert r[3] <= r[4], f"R-tree constraint violated: min_lon={r[3]} > max_lon={r[4]}"
+        # With centroid-only storage, min ≈ max (within 32-bit float rounding;
+        # SQLite R-tree rounds min down and max up to preserve the containment
+        # guarantee, so they may differ by a tiny epsilon but will be very close).
+        assert abs(r[2] - r[1]) < 1e-5, f"min_lat and max_lat too far apart: {r[1]} vs {r[2]}"
+        assert abs(r[4] - r[3]) < 1e-5, f"min_lon and max_lon too far apart: {r[3]} vs {r[4]}"
+    conn.close()
+
+
+def test_rtree_constraint_multi_worker(tmp_path):
+    """R-tree constraint must hold after multi-worker merge."""
+    entries = [
+        {**PARIS_ENTRY, "place_id": i, "centroid": [2.3 + i * 0.01, 48.8 + i * 0.01]}
+        for i in range(6)
+    ]
+    jsonl_path = _write_jsonl(tmp_path, entries)
+    db_path = str(tmp_path / "geo_rtree_multi.db")
+
+    import_database(
+        input_path=jsonl_path,
+        output_path=db_path,
+        languages=["en"],
+        num_workers=2,
+        batch_size=3,
+        show_progress=False,
+    )
+
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute(
+        "SELECT id, min_lat, max_lat, min_lon, max_lon FROM places_rtree"
+    ).fetchall()
+    assert len(rows) == 6
+    for r in rows:
+        assert r[1] <= r[2], f"Rtree min_lat > max_lat for id={r[0]}"
+        assert r[3] <= r[4], f"Rtree min_lon > max_lon for id={r[0]}"
+    conn.close()
+
+
+def test_country_names_filled_after_merge(tmp_path):
+    """Country names must be filled in the final DB even with multiple workers."""
+    jsonl_path = _write_jsonl(tmp_path, [PARIS_ENTRY, EIFFEL_ENTRY])
+    db_path = str(tmp_path / "geo_cn_merge.db")
+
+    import_database(
+        input_path=jsonl_path,
+        output_path=db_path,
+        languages=["en", "fr"],
+        num_workers=2,
+        batch_size=1,
+        show_progress=False,
+    )
+
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute(
+        """
+        SELECT s.value FROM country_names cn
+        JOIN strings s ON s.id = cn.string_id
+        WHERE cn.code = 'fr'
+        """
+    ).fetchall()
+    assert len(rows) > 0, "country_names should be filled after merge"
+    names = {r[0] for r in rows}
+    assert any("France" in n for n in names), f"Expected 'France' in country names, got {names}"
+    conn.close()

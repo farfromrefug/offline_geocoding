@@ -5,14 +5,15 @@ open :class:`sqlite3.Connection`.
 
 Search (geocoding)
 ------------------
-Uses the FTS5 ``places_fts`` virtual table with the *trigram* tokeniser for
-fast fuzzy substring matching.  An optional bounding box restricts results
+Uses the FTS5 ``places_fts`` virtual table (contentless, trigram tokeniser)
+for fast fuzzy substring matching.  Matches return ``rowid`` (== ``place_id``)
+which is joined to ``places``.  An optional bounding box restricts results
 geographically.
 
 Reverse geocoding
 -----------------
 Uses the R-tree ``places_rtree`` virtual table to find candidates within a
-square radius, then ranks them by Euclidean distance.
+square radius (centroid-to-centroid), then ranks them by Euclidean distance.
 
 Examples
 --------
@@ -40,7 +41,23 @@ import math
 import sqlite3
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from .schema import LAT_LON_SCALE, IMPORTANCE_SCALE, apply_pragmas, decompress_json
+from .schema import (
+    ADDR_TYPE_IDS,
+    IMPORTANCE_SCALE,
+    LAT_LON_SCALE,
+    NAME_KIND_IDS,
+    apply_pragmas,
+)
+
+# ---------------------------------------------------------------------------
+# Precomputed reverse-lookup dicts (no DB query needed)
+# ---------------------------------------------------------------------------
+
+#: Integer kind_id -> kind string (e.g. 1 -> "name")
+_KIND_BY_ID: Dict[int, str] = {v: k for k, v in NAME_KIND_IDS.items()}
+
+#: Integer addr_type_id -> addr_type string (e.g. 4 -> "city")
+_ADDR_TYPE_BY_ID: Dict[int, str] = {v: k for k, v in ADDR_TYPE_IDS.items()}
 
 # ---------------------------------------------------------------------------
 # Connection helper
@@ -84,47 +101,52 @@ def _resolve_country_name(
 ) -> Optional[str]:
     """Return the localised country name for *country_code*.
 
-    Results are memoised in *cache* (keyed by country_code + language list
-    fingerprint) to avoid re-decompressing the same blob for every result in
-    a search response.
-
-    The country ``names`` column is a gzip-compressed JSON object mapping
-    language code -> localised name, e.g.::
-
-        {"default": "France", "en": "France", "fr": "France"}
-
-    Lookup strategy:
-    1. Try each language in *languages* in order.
-    2. Fall back to the ``"default"`` entry (the bare OSM ``name`` tag).
+    Looks up ``country_names`` joined with ``strings`` and ``langs``.
+    Results are memoised in *cache*.
     """
     if not country_code:
         return None
 
-    # Build a cache key that incorporates the requested language order.
     lang_key = f"{country_code}|{','.join(languages)}"
     if lang_key in cache:
         return cache[lang_key]
 
-    c_row = conn.execute(
-        "SELECT names FROM countries WHERE code = ?",
+    rows = conn.execute(
+        """
+        SELECT s.value AS name, l.code AS lang
+        FROM country_names cn
+        JOIN strings s ON s.id = cn.string_id
+        JOIN langs l   ON l.id = cn.lang_id
+        WHERE cn.code = ?
+        """,
         (country_code,),
-    ).fetchone()
+    ).fetchall()
+
+    names: Dict[str, str] = {r["lang"]: r["name"] for r in rows}
 
     country_name: Optional[str] = None
-    if c_row and c_row["names"]:
-        try:
-            cnames = decompress_json(c_row["names"])
-            for lang in languages:
-                if lang in cnames:
-                    country_name = cnames[lang]
-                    break
-            if country_name is None:
-                country_name = cnames.get("default")
-        except Exception:
-            pass
+    for lang in languages:
+        if lang in names:
+            country_name = names[lang]
+            break
+    if country_name is None:
+        country_name = names.get("default")
 
     cache[lang_key] = country_name
     return country_name
+
+
+def _resolve_string(
+    conn: sqlite3.Connection,
+    string_id: Optional[int],
+) -> Optional[str]:
+    """Look up a single string by its integer ID."""
+    if string_id is None:
+        return None
+    row = conn.execute(
+        "SELECT value FROM strings WHERE id = ?", (string_id,)
+    ).fetchone()
+    return row[0] if row else None
 
 
 def _format_place(
@@ -133,22 +155,7 @@ def _format_place(
     languages: Optional[List[str]] = None,
     country_cache: Optional[Dict[str, Optional[str]]] = None,
 ) -> Dict[str, Any]:
-    """Convert a ``places`` table row into a result dictionary.
-
-    Parameters
-    ----------
-    conn:
-        Open database connection.
-    row:
-        A row from the ``places`` table (or joined result).
-    languages:
-        Preferred language order for name resolution.  Defaults to the
-        languages stored in the database.
-    country_cache:
-        Optional shared dict used to cache decompressed country name blobs
-        across multiple calls.  Pass the same dict for all results in a
-        single query to avoid redundant decompression.
-    """
+    """Convert a ``places`` table row into a result dictionary."""
     place_id: int = row["id"]
 
     if languages is None:
@@ -157,24 +164,26 @@ def _format_place(
     if country_cache is None:
         country_cache = {}
 
-    # Build {(lang, kind): name_value} from place_names + strings.
+    # Build {(lang, kind_str): name_value} from place_names + strings + langs.
     name_rows = conn.execute(
         """
-        SELECT s.value, pn.lang, pn.kind
+        SELECT s.value AS value, l.code AS lang, pn.kind_id
         FROM place_names pn
         JOIN strings s ON s.id = pn.string_id
+        JOIN langs   l ON l.id = pn.lang_id
         WHERE pn.place_id = ?
         """,
         (place_id,),
     ).fetchall()
 
-    names_by_lang_kind: Dict[Tuple[str, str], str] = {
-        (r["lang"], r["kind"]): r["value"] for r in name_rows
-    }
-    all_name_values = [r["value"] for r in name_rows]
+    names_by_lang_kind: Dict[Tuple[str, str], str] = {}
+    all_name_values: List[str] = []
+    for r in name_rows:
+        kind_str = _KIND_BY_ID.get(r["kind_id"], "name")
+        names_by_lang_kind[(r["lang"], kind_str)] = r["value"]
+        all_name_values.append(r["value"])
 
-    # Resolve display name: prefer requested languages in order, fall back
-    # to 'default'.
+    # Resolve display name.
     display_name: Optional[str] = None
     for lang in (languages or []):
         display_name = names_by_lang_kind.get((lang, "name"))
@@ -188,22 +197,20 @@ def _format_place(
     # Address components.
     addr_rows = conn.execute(
         """
-        SELECT s.value, pa.addr_type, pa.lang
+        SELECT s.value AS value, pa.addr_type_id, l.code AS lang
         FROM place_addresses pa
-        JOIN strings s ON s.id = pa.string_id
+        JOIN strings   s ON s.id = pa.string_id
+        JOIN langs     l ON l.id = pa.lang_id
         WHERE pa.place_id = ?
-        ORDER BY pa.addr_type, pa.lang
+        ORDER BY pa.addr_type_id, pa.lang_id
         """,
         (place_id,),
     ).fetchall()
 
     address: Dict[str, str] = {}
     for ar in addr_rows:
-        key = (
-            ar["addr_type"]
-            if ar["lang"] == "default"
-            else f"{ar['addr_type']}:{ar['lang']}"
-        )
+        at_str = _ADDR_TYPE_BY_ID.get(ar["addr_type_id"], "other")
+        key = at_str if ar["lang"] == "default" else f"{at_str}:{ar['lang']}"
         address[key] = ar["value"]
 
     # Categories.
@@ -218,50 +225,48 @@ def _format_place(
     ).fetchall()
     category_list = [r["name"] for r in cat_rows]
 
-    # Country name – looked up by the TEXT country_code column (no integer FK).
-    # Uses the per-call cache to avoid redundant blob decompression.
+    # Country name from country_names table.
     country_code: Optional[str] = row["country_code"]
     country_name = _resolve_country_name(
         conn, country_code, languages or [], country_cache
     )
 
+    # Resolve string-ID columns.
+    osm_key     = _resolve_string(conn, row["osm_key_id"])
+    osm_value   = _resolve_string(conn, row["osm_value_id"])
+    postcode    = _resolve_string(conn, row["postcode_id"])
+    housenumber = _resolve_string(conn, row["hn_id"])
+    address_type = _ADDR_TYPE_BY_ID.get(row["addr_type_id"]) if row["addr_type_id"] else None
+
     # Extra tags.
     extra: Optional[Dict] = None
     if row["extra"]:
         try:
+            from .schema import decompress_json
             extra = decompress_json(row["extra"])
         except Exception:
             pass
 
     result: Dict[str, Any] = {
-        "id": place_id,
-        "name": display_name,
-        "all_names": all_name_values,
-        "osm_type": row["osm_type"],
-        "osm_id": row["osm_id"],
-        "osm_key": row["osm_key"],
-        "osm_value": row["osm_value"],
-        "address_type": row["address_type"],
+        "id":           place_id,
+        "name":         display_name,
+        "all_names":    all_name_values,
+        "osm_id":       row["osm_id"],
+        "osm_key":      osm_key,
+        "osm_value":    osm_value,
+        "address_type": address_type,
         # Stored as INTEGER (×IMPORTANCE_SCALE); convert back to float.
-        "importance": row["importance"] / IMPORTANCE_SCALE,
+        "importance":   row["importance"] / IMPORTANCE_SCALE,
         # Stored as INTEGER (×LAT_LON_SCALE); convert back to float degrees.
-        "lat": row["lat"] / LAT_LON_SCALE,
-        "lon": row["lon"] / LAT_LON_SCALE,
-        "bbox": (
-            row["bbox_min_lon"],
-            row["bbox_min_lat"],
-            row["bbox_max_lon"],
-            row["bbox_max_lat"],
-        )
-        if row["bbox_min_lon"] is not None
-        else None,
-        "postcode": row["postcode"],
-        "housenumber": row["housenumber"],
+        "lat":          row["lat"] / LAT_LON_SCALE,
+        "lon":          row["lon"] / LAT_LON_SCALE,
+        "postcode":     postcode,
+        "housenumber":  housenumber,
         "country_code": country_code,
         "country_name": country_name,
-        "address": address,
-        "categories": category_list,
-        "extra": extra,
+        "address":      address,
+        "categories":   category_list,
+        "extra":        extra,
     }
     return result
 
@@ -285,11 +290,9 @@ def search(
     db:
         Path to the SQLite database or an open connection.
     query:
-        Search string.  Trigram FTS supports substring matching – partial
-        words and typos are handled without explicit wildcards.
+        Search string.  Trigram FTS supports substring matching.
     languages:
-        Preferred language order for display names.  Defaults to the
-        languages stored during import.
+        Preferred language order for display names.
     bbox:
         Optional bounding box ``(min_lon, min_lat, max_lon, max_lat)`` in
         WGS84 degrees.  Only places whose centroid falls within the box are
@@ -308,16 +311,14 @@ def search(
 
     conn, should_close = _conn(db)
     try:
-        # Escape FTS5 special characters to avoid query-syntax errors.
         fts_query = _escape_fts(query)
 
         if bbox is not None:
             min_lon, min_lat, max_lon, max_lat = bbox
-            # lat/lon are stored as INTEGER (×LAT_LON_SCALE); scale the bounds.
             sql = """
                 SELECT p.*
                 FROM places_fts fts
-                JOIN places p ON p.id = fts.place_id
+                JOIN places p ON p.id = fts.rowid
                 WHERE places_fts MATCH ?
                   AND p.lat BETWEEN ? AND ?
                   AND p.lon BETWEEN ? AND ?
@@ -334,7 +335,7 @@ def search(
             sql = """
                 SELECT p.*
                 FROM places_fts fts
-                JOIN places p ON p.id = fts.place_id
+                JOIN places p ON p.id = fts.rowid
                 WHERE places_fts MATCH ?
                 ORDER BY fts.rank, p.importance DESC
                 LIMIT ? OFFSET ?
@@ -358,10 +359,7 @@ def search_column(
     limit: int = 10,
     offset: int = 0,
 ) -> List[Dict[str, Any]]:
-    """FTS search restricted to a single FTS column (``'names'`` or ``'address'``).
-
-    Useful when you want to match only the name or only the address part.
-    """
+    """FTS search restricted to a single FTS column (``'names'`` or ``'address'``)."""
     if column not in ("names", "address"):
         raise ValueError("column must be 'names' or 'address'")
     return search(
@@ -391,6 +389,10 @@ def reverse(
     Uses the R-tree index for a fast bounding-box pre-filter, then ranks
     candidates by Euclidean distance (in degrees).
 
+    The R-tree stores centroid points (min == max for lat/lon), so the query
+    ``min_lat <= max_lat_query AND max_lat >= min_lat_query`` correctly finds
+    all centroids within the radius box.
+
     Parameters
     ----------
     db:
@@ -403,11 +405,6 @@ def reverse(
         Maximum number of results.
     languages:
         Preferred language order for display names.
-
-    Returns
-    -------
-    List of place dictionaries with an extra ``distance_deg`` key, ordered
-    by ascending distance.
     """
     conn, should_close = _conn(db)
     try:
@@ -416,13 +413,9 @@ def reverse(
         min_lon = lon - radius_deg
         max_lon = lon + radius_deg
 
-        # p.lat / p.lon are INTEGER (×LAT_LON_SCALE); convert query coords too
-        # so dist_sq is in (1e-6 °)² units and ordering is still correct.
         lat_int = round(lat * LAT_LON_SCALE)
         lon_int = round(lon * LAT_LON_SCALE)
 
-        # The places_rtree virtual table stores REAL degree coordinates so we
-        # keep the rtree filter params in degrees (unchanged).
         sql = """
             SELECT p.*,
                    ((p.lat - ?) * (p.lat - ?) + (p.lon - ?) * (p.lon - ?)) AS dist_sq
@@ -446,7 +439,6 @@ def reverse(
         for row in rows:
             place = _format_place(conn, row, languages, country_cache)
             dist_sq = row["dist_sq"]
-            # dist_sq is in (LAT_LON_SCALE × degree)² units; sqrt then rescale.
             place["distance_deg"] = math.sqrt(dist_sq) / LAT_LON_SCALE if dist_sq >= 0 else 0.0
             results.append(place)
         return results
@@ -460,11 +452,7 @@ def reverse(
 # ---------------------------------------------------------------------------
 
 def _escape_fts(query: str) -> str:
-    """Wrap *query* in double-quotes to prevent FTS5 syntax errors.
-
-    For trigram FTS, quoted phrases still perform substring matching.
-    """
-    # Remove any existing quotes to avoid nesting issues.
+    """Wrap *query* in double-quotes to prevent FTS5 syntax errors."""
     clean = query.replace('"', ' ').strip()
     if not clean:
         return '""'
@@ -492,6 +480,7 @@ def stats(db: _DbArg) -> Dict[str, int]:
                 "strings",
                 "categories",
                 "countries",
+                "country_names",
                 "place_names",
                 "place_addresses",
                 "place_categories",

@@ -7,26 +7,43 @@ Design Goals
   their own temporary database; a SQL-driven merge step deduplicates across
   workers using temp mapping tables.
 * **Compact storage** – shared ``strings`` table means "Paris" is stored once
-  even if thousands of places reference it as a city or name.
-* **Language-aware queries** – country names stored as a gzip-compressed JSON
-  map ``{lang: name}``; all other name/address variants stored as rows in
-  ``place_names`` / ``place_addresses`` with an explicit ``lang`` column.
-* **Fast search** – FTS5 with trigram tokeniser for fuzzy substring matching;
-  R-tree for reverse geocoding.
+  even if thousands of places reference it as a city or name.  ``langs``,
+  ``name_kinds``, and ``addr_types`` are tiny lookup tables whose IDs replace
+  repeated TEXT columns throughout the schema.
+* **Language-aware queries** – all name/address variants stored as rows in
+  ``place_names`` / ``place_addresses`` with ``lang_id`` referencing the
+  ``langs`` table.  Country names stored in ``country_names`` the same way.
+* **Fast search** – FTS5 contentless table (no ``_content`` shadow table) with
+  trigram tokeniser for fuzzy substring matching; R-tree for reverse geocoding.
+
+Normalisation rules
+-------------------
+* ``langs`` / ``name_kinds`` / ``addr_types`` are **pre-seeded** at database
+  creation time with fixed IDs from the constants ``NAME_KIND_IDS`` and
+  ``ADDR_TYPE_IDS``.  ``langs`` gets IDs assigned from sorted({"default"} |
+  user_languages).  Because all worker databases and the final database are
+  created with the same language list and the same pre-seeded tables, their
+  IDs are **always identical** — no remapping is needed for these tables
+  during the merge step.
+* Only ``strings`` (via ``_smap``) and ``categories`` (via ``_cmap``) need
+  ID remapping during merge.
 
 Tables (final database)
 -----------------------
-metadata          – key/value store for import settings
-countries         – ISO country codes keyed by ``code TEXT PRIMARY KEY``
-                    + gzip-compressed JSON name map  (lang → name)
-strings           – interned text values; INTEGER PRIMARY KEY (AUTOINCREMENT)
-categories        – interned OSM category strings; INTEGER PRIMARY KEY
-places            – one row per photon place entry; references country by code
-place_names       – N:M place ↔ string with lang + kind columns
-place_addresses   – N:M place ↔ string with addr_type + lang columns
-place_categories  – N:M place ↔ category
-places_fts        – FTS5 virtual table, trigram tokeniser (fuzzy search)
-places_rtree      – R-tree spatial index for reverse geocoding
+metadata         – key/value store for import settings
+langs            – interned language codes; INTEGER PK, pre-seeded
+name_kinds       – interned name-kind strings ('name', 'alt', ...); pre-seeded
+addr_types       – interned address-type strings ('city', 'country', ...); pre-seeded
+strings          – interned text values; INTEGER PRIMARY KEY (AUTOINCREMENT)
+categories       – interned OSM category strings; INTEGER PRIMARY KEY
+countries        – ISO country codes keyed by ``code TEXT PRIMARY KEY``
+country_names    – localised country names; references strings + langs
+places           – one row per photon place entry; normalised columns
+place_names      – N:M place ↔ string with lang_id + kind_id columns
+place_addresses  – N:M place ↔ string with addr_type_id + lang_id columns
+place_categories – N:M place ↔ category
+places_fts       – FTS5 contentless virtual table, trigram tokeniser
+places_rtree     – R-tree spatial index; stores centroid as (min==max) point
 
 Worker databases (temporary, one per worker process)
 -----------------------------------------------------
@@ -35,14 +52,14 @@ Instead two plain tables hold the data that will be loaded into the virtual
 tables during the final merge step:
 
 fts_data   – (place_id, names TEXT, address TEXT)
-rtree_data – (id, min_lat, max_lat, min_lon, max_lon)
+rtree_data – (id, lat INTEGER, lon INTEGER)   -- centroid only
 """
 
 import gzip
 import json
 import logging
 import sqlite3
-from typing import Any, List
+from typing import Any, Dict, List, Sequence
 
 log = logging.getLogger(__name__)
 
@@ -57,6 +74,48 @@ LAT_LON_SCALE: int = 1_000_000
 #: importance is stored as ``round(value * IMPORTANCE_SCALE)`` (INTEGER).
 #: 2 decimal digits are sufficient for scoring.
 IMPORTANCE_SCALE: int = 100
+
+# ---------------------------------------------------------------------------
+# Fixed normalisation mappings
+# ---------------------------------------------------------------------------
+
+#: Maps OSM name-kind string to its pre-seeded integer ID.
+#: These IDs are the same in every worker DB and the final DB.
+NAME_KIND_IDS: Dict[str, int] = {
+    "name":     1,
+    "alt":      2,
+    "old":      3,
+    "int":      4,
+    "loc":      5,
+    "short":    6,
+    "official": 7,
+}
+
+#: Maps address-type string to its pre-seeded integer ID.
+#: These IDs are the same in every worker DB and the final DB.
+ADDR_TYPE_IDS: Dict[str, int] = {
+    "country":  1,
+    "state":    2,
+    "county":   3,
+    "city":     4,
+    "district": 5,
+    "locality": 6,
+    "street":   7,
+    "other":    8,
+}
+
+
+def build_lang_ids(languages: Sequence[str]) -> Dict[str, int]:
+    """Return ``{lang_code: id}`` for ``'default'`` plus every language in
+    *languages*.
+
+    IDs are assigned to sorted codes (ascending), starting at 1.  Because all
+    databases in an import run are created with the same *languages* list,
+    they all produce the same mapping — no ID remapping is needed during merge.
+    """
+    codes = sorted({"default"} | set(languages))
+    return {code: i + 1 for i, code in enumerate(codes)}
+
 
 # ---------------------------------------------------------------------------
 # Schema DDL – shared between final and worker databases
@@ -90,15 +149,25 @@ CREATE TABLE IF NOT EXISTS metadata (
     value TEXT NOT NULL
 );
 
--- One row per country.
--- ``code`` is the ISO 3166-1 alpha-2 code used as a natural key.
--- ``names`` is a gzip-compressed JSON object mapping lang -> localised name,
--- e.g. {"default": "France", "en": "France", "fr": "France"}.
--- Queries decompress this blob in Python and look up by language code,
--- so country names support the same multi-language query as place names.
-CREATE TABLE IF NOT EXISTS countries (
-    code  TEXT PRIMARY KEY,
-    names BLOB NOT NULL DEFAULT X''
+-- Interned language codes.  Seeded at DB creation time from the user's
+-- language list + 'default'.  Same IDs in all worker DBs and the final DB.
+CREATE TABLE IF NOT EXISTS langs (
+    id   INTEGER PRIMARY KEY,
+    code TEXT UNIQUE NOT NULL
+);
+
+-- Interned name-kind strings ('name', 'alt', 'old', ...).
+-- Pre-seeded with fixed IDs from NAME_KIND_IDS.
+CREATE TABLE IF NOT EXISTS name_kinds (
+    id   INTEGER PRIMARY KEY,
+    kind TEXT UNIQUE NOT NULL
+);
+
+-- Interned address-type strings ('country', 'city', 'street', ...).
+-- Pre-seeded with fixed IDs from ADDR_TYPE_IDS.
+CREATE TABLE IF NOT EXISTS addr_types (
+    id   INTEGER PRIMARY KEY,
+    type TEXT UNIQUE NOT NULL
 );
 
 -- Interned text strings.  Every unique address component, place name, etc.
@@ -117,54 +186,62 @@ CREATE TABLE IF NOT EXISTS categories (
     name TEXT UNIQUE NOT NULL
 );
 
--- Core place record.
--- ``country_code`` references countries(code) directly – no integer FK
--- indirection – so the merge step does not need to remap country IDs.
--- ``extra`` is a gzip-compressed JSON blob of arbitrary extra OSM tags.
--- ``importance`` is stored as round(value * IMPORTANCE_SCALE) (INTEGER).
--- ``lat`` / ``lon`` are stored as round(degrees * LAT_LON_SCALE) (INTEGER).
+-- One row per country.
+-- ``code`` is the ISO 3166-1 alpha-2 code used as a natural key.
+-- Country names are stored in ``country_names`` (like place_names).
+CREATE TABLE IF NOT EXISTS countries (
+    code TEXT PRIMARY KEY
+);
+
+-- Localised country names.
+-- Same structure as place_names: string_id references strings(id),
+-- lang_id references langs(id).  This makes country names queryable
+-- via FTS5 like any other address component.
+CREATE TABLE IF NOT EXISTS country_names (
+    code      TEXT    NOT NULL REFERENCES countries(code) ON DELETE CASCADE,
+    string_id INTEGER NOT NULL REFERENCES strings(id),
+    lang_id   INTEGER NOT NULL REFERENCES langs(id),
+    PRIMARY KEY (code, lang_id)
+);
+
+-- Core place record.  Heavily normalised: TEXT columns replaced by INTEGER
+-- foreign keys wherever the cardinality is bounded.
+-- ``importance`` stored as round(value * IMPORTANCE_SCALE) (INTEGER).
+-- ``lat`` / ``lon`` stored as round(degrees * LAT_LON_SCALE) (INTEGER).
 CREATE TABLE IF NOT EXISTS places (
     id           INTEGER PRIMARY KEY,
     photon_id    TEXT,
-    osm_type     TEXT,
     osm_id       INTEGER,
-    osm_key      TEXT,
-    osm_value    TEXT,
-    address_type TEXT,
+    osm_key_id   INTEGER REFERENCES strings(id),
+    osm_value_id INTEGER REFERENCES strings(id),
+    addr_type_id INTEGER REFERENCES addr_types(id),
     importance   INTEGER NOT NULL DEFAULT 0,
     country_code TEXT    REFERENCES countries(code),
-    postcode     TEXT,
-    housenumber  TEXT,
+    postcode_id  INTEGER REFERENCES strings(id),
+    hn_id        INTEGER REFERENCES strings(id),
     lat          INTEGER NOT NULL,
     lon          INTEGER NOT NULL,
-    bbox_min_lon REAL,
-    bbox_min_lat REAL,
-    bbox_max_lon REAL,
-    bbox_max_lat REAL,
     extra        BLOB
 );
 
 -- Multilingual names for a place.
--- lang: 'default' for the bare OSM ``name`` tag, otherwise ISO language code.
--- kind: 'name' | 'alt' | 'old' | 'int' | 'loc' | 'short' | 'official'
+-- lang_id → langs(id); kind_id → name_kinds(id).
 CREATE TABLE IF NOT EXISTS place_names (
-    place_id  INTEGER NOT NULL REFERENCES places(id)  ON DELETE CASCADE,
+    place_id  INTEGER NOT NULL REFERENCES places(id)     ON DELETE CASCADE,
     string_id INTEGER NOT NULL REFERENCES strings(id),
-    lang      TEXT    NOT NULL,
-    kind      TEXT    NOT NULL DEFAULT 'name',
-    PRIMARY KEY (place_id, string_id, lang, kind)
+    lang_id   INTEGER NOT NULL REFERENCES langs(id),
+    kind_id   INTEGER NOT NULL REFERENCES name_kinds(id),
+    PRIMARY KEY (place_id, string_id, lang_id, kind_id)
 );
 
 -- Address components for a place.
--- addr_type: 'country' | 'state' | 'county' | 'city' | 'district' |
---            'locality' | 'street' | 'other'
--- lang: 'default' | ISO language code
+-- addr_type_id → addr_types(id); lang_id → langs(id).
 CREATE TABLE IF NOT EXISTS place_addresses (
-    place_id  INTEGER NOT NULL REFERENCES places(id)  ON DELETE CASCADE,
-    string_id INTEGER NOT NULL REFERENCES strings(id),
-    addr_type TEXT    NOT NULL,
-    lang      TEXT    NOT NULL,
-    PRIMARY KEY (place_id, addr_type, lang)
+    place_id     INTEGER NOT NULL REFERENCES places(id)     ON DELETE CASCADE,
+    string_id    INTEGER NOT NULL REFERENCES strings(id),
+    addr_type_id INTEGER NOT NULL REFERENCES addr_types(id),
+    lang_id      INTEGER NOT NULL REFERENCES langs(id),
+    PRIMARY KEY (place_id, addr_type_id, lang_id)
 );
 
 -- Categories assigned to a place.
@@ -185,31 +262,34 @@ CREATE TABLE IF NOT EXISTS fts_data (
     address  TEXT NOT NULL DEFAULT ''
 );
 
--- Staging table for R-tree data; same lifecycle as fts_data.
--- Coordinates stored as round(degrees * LAT_LON_SCALE) to save space;
--- converted back to REAL when inserted into the places_rtree virtual table.
+-- Staging table for R-tree data.
+-- Only the centroid (lat, lon) is stored; the R-tree virtual table receives
+-- a degenerate bounding box where min == max (a point), which always satisfies
+-- the SQLite R-tree constraint min_lat <= max_lat / min_lon <= max_lon.
+-- Coordinates are stored as round(degrees * LAT_LON_SCALE) (INTEGER).
 CREATE TABLE IF NOT EXISTS rtree_data (
-    id      INTEGER PRIMARY KEY,
-    min_lat INTEGER NOT NULL,
-    max_lat INTEGER NOT NULL,
-    min_lon INTEGER NOT NULL,
-    max_lon INTEGER NOT NULL
+    id  INTEGER PRIMARY KEY,
+    lat INTEGER NOT NULL,
+    lon INTEGER NOT NULL
 );
 """
 
-# FTS5 with trigram tokeniser – enables efficient substring / fuzzy search.
-# `names`   : space-separated concatenation of all name variants (all langs).
-# `address` : space-separated concatenation of all address tokens (all langs).
+# FTS5 contentless virtual table.
+# ``content=''`` means the FTS5 shadow ``_content`` table is NOT populated –
+# names/address text are NOT stored twice.  The trigram index (_data) is
+# built from the text passed during INSERT and is used for MATCH queries.
+# Queries retrieve the matching ``rowid`` (== place_id) and join ``places``.
 _FTS = """
 CREATE VIRTUAL TABLE IF NOT EXISTS places_fts USING fts5(
-    place_id UNINDEXED,
     names,
     address,
+    content='',
     tokenize = 'trigram case_sensitive 0'
 );
 """
 
 # R-tree virtual table for fast bounding-box reverse geocoding.
+# Centroid stored as a degenerate box: min_lat == max_lat, min_lon == max_lon.
 _RTREE = """
 CREATE VIRTUAL TABLE IF NOT EXISTS places_rtree USING rtree(
     id,
@@ -220,13 +300,14 @@ CREATE VIRTUAL TABLE IF NOT EXISTS places_rtree USING rtree(
 
 _INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_places_country    ON places(country_code);
-CREATE INDEX IF NOT EXISTS idx_places_osm        ON places(osm_type, osm_id);
+CREATE INDEX IF NOT EXISTS idx_places_osm        ON places(osm_id);
 CREATE INDEX IF NOT EXISTS idx_places_importance ON places(importance DESC);
 CREATE INDEX IF NOT EXISTS idx_places_photon_id  ON places(photon_id);
 CREATE INDEX IF NOT EXISTS idx_place_names_place ON place_names(place_id);
-CREATE INDEX IF NOT EXISTS idx_place_names_lang  ON place_names(lang, kind);
+CREATE INDEX IF NOT EXISTS idx_place_names_lang  ON place_names(lang_id, kind_id);
 CREATE INDEX IF NOT EXISTS idx_place_addr_place  ON place_addresses(place_id);
 CREATE INDEX IF NOT EXISTS idx_place_cat_place   ON place_categories(place_id);
+CREATE INDEX IF NOT EXISTS idx_country_names     ON country_names(code);
 """
 
 
@@ -244,7 +325,39 @@ def _check_sqlite_version() -> None:
         )
 
 
-def create_database(path: str, with_indexes: bool = True) -> sqlite3.Connection:
+def _seed_fixed_tables(
+    conn: sqlite3.Connection,
+    languages: Sequence[str],
+) -> None:
+    """Pre-seed ``langs``, ``name_kinds``, and ``addr_types`` with fixed IDs.
+
+    Safe to call multiple times (``INSERT OR IGNORE``).  Must be called
+    inside an active transaction or with autocommit.
+    """
+    # langs: sorted({"default"} | set(languages)), IDs start at 1.
+    for code, lid in build_lang_ids(languages).items():
+        conn.execute(
+            "INSERT OR IGNORE INTO langs(id, code) VALUES (?, ?)", (lid, code)
+        )
+
+    # name_kinds: fixed mapping from NAME_KIND_IDS.
+    for kind, kid in NAME_KIND_IDS.items():
+        conn.execute(
+            "INSERT OR IGNORE INTO name_kinds(id, kind) VALUES (?, ?)", (kid, kind)
+        )
+
+    # addr_types: fixed mapping from ADDR_TYPE_IDS.
+    for atype, aid in ADDR_TYPE_IDS.items():
+        conn.execute(
+            "INSERT OR IGNORE INTO addr_types(id, type) VALUES (?, ?)", (aid, atype)
+        )
+
+
+def create_database(
+    path: str,
+    languages: Sequence[str] = (),
+    with_indexes: bool = True,
+) -> sqlite3.Connection:
     """Create (or open) the **final** geocoding database and apply its schema.
 
     The final database has FTS5 and R-tree virtual tables in addition to all
@@ -254,6 +367,10 @@ def create_database(path: str, with_indexes: bool = True) -> sqlite3.Connection:
     ----------
     path:
         Filesystem path for the SQLite file.
+    languages:
+        ISO language codes to pre-seed into the ``langs`` table.  Should be
+        the same list that is passed to worker processes so that
+        ``lang_id`` values are consistent across all databases.
     with_indexes:
         When ``True`` (default) the secondary B-tree indexes are created
         immediately.  Pass ``False`` to defer index creation to the end of the
@@ -270,6 +387,8 @@ def create_database(path: str, with_indexes: bool = True) -> sqlite3.Connection:
         for stmt in _split_statements(block):
             conn.execute(stmt)
 
+    _seed_fixed_tables(conn, languages)
+
     if with_indexes:
         create_indexes(conn)
 
@@ -280,13 +399,15 @@ def create_indexes(conn: sqlite3.Connection) -> None:
     """Create (or ensure existence of) all secondary B-tree indexes.
 
     Safe to call multiple times – every statement uses ``IF NOT EXISTS``.
-    Commit the connection after calling this function if needed.
     """
     for stmt in _split_statements(_INDEXES):
         conn.execute(stmt)
 
 
-def create_worker_database(path: str) -> sqlite3.Connection:
+def create_worker_database(
+    path: str,
+    languages: Sequence[str] = (),
+) -> sqlite3.Connection:
     """Create a **worker** temporary database used during parallel import.
 
     Worker databases contain the same relational tables as the final database
@@ -308,6 +429,8 @@ def create_worker_database(path: str) -> sqlite3.Connection:
     for block in (_COMMON_TABLES, _WORKER_PLAIN_TABLES):
         for stmt in _split_statements(block):
             conn.execute(stmt)
+
+    _seed_fixed_tables(conn, languages)
 
     return conn
 
