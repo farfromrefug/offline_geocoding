@@ -149,6 +149,19 @@ def _resolve_string(
     return row[0] if row else None
 
 
+def _resolve_osm_tag_token(
+    conn: sqlite3.Connection,
+    tag_id: Optional[int],
+) -> Optional[str]:
+    """Look up an OSM tag token string by its ``osm_tags.id``."""
+    if tag_id is None:
+        return None
+    row = conn.execute(
+        "SELECT token FROM osm_tags WHERE id = ?", (tag_id,)
+    ).fetchone()
+    return row[0] if row else None
+
+
 def _format_place(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -232,8 +245,8 @@ def _format_place(
     )
 
     # Resolve string-ID columns.
-    osm_key     = _resolve_string(conn, row["osm_key_id"])
-    osm_value   = _resolve_string(conn, row["osm_value_id"])
+    osm_key     = _resolve_osm_tag_token(conn, row["osm_key_id"])
+    osm_value   = _resolve_osm_tag_token(conn, row["osm_value_id"])
     postcode    = _resolve_string(conn, row["postcode_id"])
     housenumber = _resolve_string(conn, row["hn_id"])
     address_type = _ADDR_TYPE_BY_ID.get(row["addr_type_id"]) if row["addr_type_id"] else None
@@ -479,11 +492,14 @@ def stats(db: _DbArg) -> Dict[str, int]:
                 "places",
                 "strings",
                 "categories",
+                "osm_tags",
+                "osm_tag_names",
                 "countries",
                 "country_names",
                 "place_names",
                 "place_addresses",
                 "place_categories",
+                "place_osm_tags",
             )
         }
     finally:

@@ -14,6 +14,7 @@ import pytest
 from offline_geocoding.importer import (
     _extract_addresses,
     _extract_names,
+    _parse_category_parts,
     _parse_place_entry,
     import_database,
 )
@@ -251,6 +252,7 @@ def test_import_basic(tmp_path):
         languages=["en", "fr"],
         num_workers=1,
         show_progress=False,
+        fetch_translations=False,
     )
 
     conn = sqlite3.connect(db_path)
@@ -300,6 +302,7 @@ def test_import_language_filter(tmp_path):
         languages=["en"],
         num_workers=1,
         show_progress=False,
+        fetch_translations=False,
     )
 
     conn = sqlite3.connect(db_path)
@@ -339,6 +342,7 @@ END
         poly_file=str(poly_file),
         num_workers=1,
         show_progress=False,
+        fetch_translations=False,
     )
 
     conn = sqlite3.connect(db_path)
@@ -360,6 +364,7 @@ def test_import_no_duplicate_strings(tmp_path):
         languages=["en", "fr"],
         num_workers=1,
         show_progress=False,
+        fetch_translations=False,
     )
 
     conn = sqlite3.connect(db_path)
@@ -395,6 +400,7 @@ def test_import_no_duplicate_strings_multi_worker(tmp_path):
         num_workers=2,
         batch_size=2,
         show_progress=False,
+        fetch_translations=False,
     )
 
     conn = sqlite3.connect(db_path)
@@ -418,6 +424,7 @@ def test_import_metadata(tmp_path):
         languages=["en", "fr"],
         num_workers=1,
         show_progress=False,
+        fetch_translations=False,
     )
 
     conn = sqlite3.connect(db_path)
@@ -447,6 +454,7 @@ def test_import_place_without_country_info(tmp_path):
         languages=["en", "fr"],
         num_workers=1,
         show_progress=False,
+        fetch_translations=False,
     )
 
     conn = sqlite3.connect(db_path)
@@ -470,6 +478,7 @@ def test_import_single_thread_mode(tmp_path):
         languages=["en", "fr"],
         single_thread=True,
         show_progress=False,
+        fetch_translations=False,
     )
 
     conn = sqlite3.connect(db_path)
@@ -506,6 +515,7 @@ def test_schema_integer_lat_lon_importance(tmp_path):
         languages=["en"],
         num_workers=1,
         show_progress=False,
+        fetch_translations=False,
     )
 
     conn = sqlite3.connect(db_path)
@@ -533,6 +543,7 @@ def test_import_country_names_in_strings(tmp_path):
         languages=["en", "fr"],
         num_workers=1,
         show_progress=False,
+        fetch_translations=False,
     )
 
     conn = sqlite3.connect(db_path)
@@ -559,7 +570,7 @@ def test_import_country_names_in_strings(tmp_path):
 
 
 def test_import_places_use_string_ids(tmp_path):
-    """osm_key_id, osm_value_id, postcode_id, hn_id must be integer references to strings."""
+    """osm_key_id and osm_value_id must be integer references to osm_tags; postcode_id/hn_id reference strings."""
     jsonl_path = _write_jsonl(tmp_path, [PARIS_ENTRY])
     db_path = str(tmp_path / "geo_ids.db")
 
@@ -569,6 +580,7 @@ def test_import_places_use_string_ids(tmp_path):
         languages=["en"],
         num_workers=1,
         show_progress=False,
+        fetch_translations=False,
     )
 
     conn = sqlite3.connect(db_path)
@@ -585,11 +597,11 @@ def test_import_places_use_string_ids(tmp_path):
     for removed in ("osm_key", "osm_value", "address_type", "postcode", "housenumber"):
         assert removed not in col_names
 
-    # osm_key_id should resolve via strings table.
+    # osm_key_id should resolve via osm_tags table (NOT strings table).
     row = conn.execute(
         """
-        SELECT s.value
-        FROM places p JOIN strings s ON s.id = p.osm_key_id
+        SELECT t.token
+        FROM places p JOIN osm_tags t ON t.id = p.osm_key_id
         LIMIT 1
         """
     ).fetchone()
@@ -635,6 +647,7 @@ def test_rtree_centroid_constraint(tmp_path):
         languages=["en"],
         num_workers=1,
         show_progress=False,
+        fetch_translations=False,
     )
 
     conn = sqlite3.connect(db_path)
@@ -672,6 +685,7 @@ def test_rtree_constraint_multi_worker(tmp_path):
         num_workers=2,
         batch_size=3,
         show_progress=False,
+        fetch_translations=False,
     )
 
     conn = sqlite3.connect(db_path)
@@ -697,6 +711,7 @@ def test_country_names_filled_after_merge(tmp_path):
         num_workers=2,
         batch_size=1,
         show_progress=False,
+        fetch_translations=False,
     )
 
     conn = sqlite3.connect(db_path)
@@ -711,3 +726,282 @@ def test_country_names_filled_after_merge(tmp_path):
     names = {r[0] for r in rows}
     assert any("France" in n for n in names), f"Expected 'France' in country names, got {names}"
     conn.close()
+
+
+# ---------------------------------------------------------------------------
+# _parse_category_parts unit tests
+# ---------------------------------------------------------------------------
+
+def test_parse_category_parts_osm_prefix():
+    result = _parse_category_parts("osm.natural.peak")
+    assert result == [("natural", "natural"), ("peak", "natural=peak")]
+
+
+def test_parse_category_parts_no_osm_prefix():
+    result = _parse_category_parts("place.city")
+    assert result == [("place", "place"), ("city", "place=city")]
+
+
+def test_parse_category_parts_two_parts():
+    result = _parse_category_parts("amenity.restaurant")
+    assert result == [("amenity", "amenity"), ("restaurant", "amenity=restaurant")]
+
+
+def test_parse_category_parts_three_parts():
+    result = _parse_category_parts("food.shop.supermarket")
+    assert result == [
+        ("food", "food"),
+        ("shop", "food=shop"),
+        ("supermarket", "shop=supermarket"),
+    ]
+
+
+def test_parse_category_parts_single():
+    result = _parse_category_parts("tourism")
+    assert result == [("tourism", "tourism")]
+
+
+def test_parse_category_parts_empty():
+    assert _parse_category_parts("") == []
+    assert _parse_category_parts(".") == []
+
+
+def test_parse_category_parts_osm_only():
+    result = _parse_category_parts("osm")
+    assert result == [("osm", "osm")]
+
+
+# ---------------------------------------------------------------------------
+# osm_tags table tests
+# ---------------------------------------------------------------------------
+
+def test_import_osm_tags_populated(tmp_path):
+    """osm_tags must have entries for osm_key/osm_value tokens after import."""
+    jsonl_path = _write_jsonl(tmp_path, [PARIS_ENTRY, EIFFEL_ENTRY])
+    db_path = str(tmp_path / "geo_osm_tags.db")
+
+    import_database(
+        input_path=jsonl_path,
+        output_path=db_path,
+        languages=["en", "fr"],
+        num_workers=1,
+        show_progress=False,
+        fetch_translations=False,
+    )
+
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute("SELECT token, ctx FROM osm_tags").fetchall()
+    ctxs = {r[1] for r in rows}
+    tokens = {r[0] for r in rows}
+
+    # Paris: osm_key="place", osm_value="city", category "place.city"
+    assert "place" in ctxs
+    assert "place=city" in ctxs
+
+    # Eiffel: osm_key="tourism", osm_value="attraction", category "tourism.attraction"
+    assert "tourism" in ctxs
+    assert "tourism=attraction" in ctxs
+
+    assert "place" in tokens
+    assert "city" in tokens
+    assert "tourism" in tokens
+    assert "attraction" in tokens
+
+    conn.close()
+
+
+def test_import_place_osm_tags_populated(tmp_path):
+    """place_osm_tags must link each place to its category token parts."""
+    jsonl_path = _write_jsonl(tmp_path, [PARIS_ENTRY])
+    db_path = str(tmp_path / "geo_pot.db")
+
+    import_database(
+        input_path=jsonl_path,
+        output_path=db_path,
+        languages=["en"],
+        num_workers=1,
+        show_progress=False,
+        fetch_translations=False,
+    )
+
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute(
+        """
+        SELECT ot.token, ot.ctx
+        FROM place_osm_tags pot
+        JOIN osm_tags ot ON ot.id = pot.tag_id
+        WHERE pot.place_id = (SELECT id FROM places LIMIT 1)
+        """
+    ).fetchall()
+    ctxs = {r[1] for r in rows}
+
+    # Paris has category "place.city" -> tokens "place" and "city"
+    assert "place" in ctxs
+    assert "place=city" in ctxs
+    conn.close()
+
+
+def test_import_osm_key_resolves_via_osm_tags(tmp_path):
+    """places.osm_key_id must reference osm_tags, not strings."""
+    jsonl_path = _write_jsonl(tmp_path, [PARIS_ENTRY])
+    db_path = str(tmp_path / "geo_okt.db")
+
+    import_database(
+        input_path=jsonl_path,
+        output_path=db_path,
+        languages=["en"],
+        num_workers=1,
+        show_progress=False,
+        fetch_translations=False,
+    )
+
+    conn = sqlite3.connect(db_path)
+    row = conn.execute(
+        """
+        SELECT ot.token, ot.ctx
+        FROM places p
+        JOIN osm_tags ot ON ot.id = p.osm_key_id
+        LIMIT 1
+        """
+    ).fetchone()
+    assert row is not None
+    assert row[0] == "place"
+    assert row[1] == "place"
+
+    row2 = conn.execute(
+        """
+        SELECT ot.token, ot.ctx
+        FROM places p
+        JOIN osm_tags ot ON ot.id = p.osm_value_id
+        LIMIT 1
+        """
+    ).fetchone()
+    assert row2 is not None
+    assert row2[0] == "city"
+    assert row2[1] == "place=city"
+    conn.close()
+
+
+def test_import_fts_includes_category_tokens(tmp_path):
+    """FTS names column must include raw category tokens for searchability."""
+    jsonl_path = _write_jsonl(tmp_path, [EIFFEL_ENTRY])
+    db_path = str(tmp_path / "geo_fts_cat.db")
+
+    import_database(
+        input_path=jsonl_path,
+        output_path=db_path,
+        languages=["en", "fr"],
+        num_workers=1,
+        show_progress=False,
+        fetch_translations=False,
+    )
+
+    from offline_geocoding.query import search
+
+    results = search(db_path, "attraction", languages=["en"])
+    assert len(results) > 0, "FTS must find Eiffel Tower by category token 'attraction'"
+    names = [r["name"] for r in results]
+    assert any("Eiffel" in n for n in names), f"Expected Eiffel Tower in results, got {names}"
+
+
+def test_import_osm_tag_names_with_translations(tmp_path):
+    """When translations are provided directly, osm_tag_names must be populated."""
+    from offline_geocoding.importer import (
+        _LocalOsmTagCache,
+        _LocalStringCache,
+    )
+
+    db_path = str(tmp_path / "osm_tag_names.db")
+    from offline_geocoding.schema import build_lang_ids, create_worker_database
+
+    languages = ["en", "fr"]
+    lang_ids = build_lang_ids(languages)
+    translations = {
+        "fr": {"natural": "Naturel", "natural=peak": "Sommet"},
+        "en": {"natural": "Natural", "natural=peak": "Peak"},
+    }
+
+    conn = create_worker_database(db_path, languages=languages)
+    conn.execute("BEGIN")
+    strings = _LocalStringCache(conn)
+    cache = _LocalOsmTagCache(conn, translations, lang_ids, strings)
+
+    tid = cache.get_id("natural", "natural")
+    assert tid is not None
+
+    conn.execute("COMMIT")
+
+    # osm_tag_names should have translations for "natural"
+    rows = conn.execute(
+        """
+        SELECT s.value, l.code
+        FROM osm_tag_names otn
+        JOIN strings s ON s.id = otn.string_id
+        JOIN langs l ON l.id = otn.lang_id
+        WHERE otn.tag_id = ?
+        """,
+        (tid,),
+    ).fetchall()
+    lang_to_label = {r[1]: r[0] for r in rows}
+    assert "fr" in lang_to_label, f"French translation missing, got {lang_to_label}"
+    assert lang_to_label["fr"] == "Naturel"
+    assert "en" in lang_to_label
+    assert lang_to_label["en"] == "Natural"
+    conn.close()
+
+
+def test_import_osm_tags_dedup_multi_worker(tmp_path):
+    """osm_tags must be globally deduplicated across multiple workers."""
+    entries = [
+        {**PARIS_ENTRY, "place_id": i, "centroid": [2.3 + i * 0.01, 48.8 + i * 0.01]}
+        for i in range(4)
+    ]
+    jsonl_path = _write_jsonl(tmp_path, entries)
+    db_path = str(tmp_path / "geo_osm_tags_multi.db")
+
+    import_database(
+        input_path=jsonl_path,
+        output_path=db_path,
+        languages=["en"],
+        num_workers=2,
+        batch_size=2,
+        show_progress=False,
+        fetch_translations=False,
+    )
+
+    conn = sqlite3.connect(db_path)
+    # No duplicate ctx values in osm_tags.
+    dups = conn.execute(
+        "SELECT ctx, COUNT(*) AS c FROM osm_tags GROUP BY ctx HAVING c > 1"
+    ).fetchall()
+    assert len(dups) == 0, f"Duplicate osm_tags found: {[r[0] for r in dups]}"
+    conn.close()
+
+
+def test_import_fts_includes_category_tokens_multi_worker(tmp_path):
+    """Category tokens are searchable via FTS5 after multi-worker merge."""
+    entries = [PARIS_ENTRY, EIFFEL_ENTRY]
+    jsonl_path = _write_jsonl(tmp_path, entries)
+    db_path = str(tmp_path / "geo_fts_cat_multi.db")
+
+    import_database(
+        input_path=jsonl_path,
+        output_path=db_path,
+        languages=["en", "fr"],
+        num_workers=2,
+        batch_size=1,
+        show_progress=False,
+        fetch_translations=False,
+    )
+
+    from offline_geocoding.query import search
+
+    # "tourism" token must find Eiffel Tower
+    results = search(db_path, "tourism", languages=["en"])
+    assert len(results) > 0
+    assert any("Eiffel" in r["name"] for r in results)
+
+    # "city" token must find Paris
+    results2 = search(db_path, "city", languages=["en"])
+    assert len(results2) > 0
+    assert any("Paris" in r["name"] for r in results2)

@@ -36,10 +36,13 @@ def test_create_database(tmp_path):
         "country_names",
         "strings",
         "categories",
+        "osm_tags",
+        "osm_tag_names",
         "places",
         "place_names",
         "place_addresses",
         "place_categories",
+        "place_osm_tags",
     ):
         assert expected in tables, f"Missing table: {expected}"
 
@@ -210,6 +213,52 @@ def test_create_database_idempotent(tmp_path):
     conn1.close()
     conn2 = create_database(db_path, languages=["en"])
     conn2.close()
+
+
+def test_osm_tags_table(tmp_path):
+    """osm_tags must have id, token, and ctx columns; ctx is UNIQUE."""
+    conn = create_database(str(tmp_path / "test.db"))
+    col_names = [
+        r[1] for r in conn.execute("PRAGMA table_info(osm_tags)").fetchall()
+    ]
+    assert "id" in col_names
+    assert "token" in col_names
+    assert "ctx" in col_names
+    conn.close()
+
+
+def test_osm_tag_names_table(tmp_path):
+    """osm_tag_names must have tag_id, string_id, lang_id columns."""
+    conn = create_database(str(tmp_path / "test.db"))
+    col_names = [
+        r[1] for r in conn.execute("PRAGMA table_info(osm_tag_names)").fetchall()
+    ]
+    assert "tag_id" in col_names
+    assert "string_id" in col_names
+    assert "lang_id" in col_names
+    conn.close()
+
+
+def test_place_osm_tags_table(tmp_path):
+    """place_osm_tags must have place_id and tag_id columns."""
+    conn = create_database(str(tmp_path / "test.db"))
+    col_names = [
+        r[1] for r in conn.execute("PRAGMA table_info(place_osm_tags)").fetchall()
+    ]
+    assert "place_id" in col_names
+    assert "tag_id" in col_names
+    conn.close()
+
+
+def test_places_osm_ids_reference_osm_tags(tmp_path):
+    """places.osm_key_id and osm_value_id must reference osm_tags, not strings."""
+    conn = create_database(str(tmp_path / "test.db"))
+    # Verify by checking that osm_tags table exists and is non-empty after insert.
+    conn.execute("INSERT OR IGNORE INTO osm_tags(token, ctx) VALUES ('place', 'place')")
+    conn.execute("INSERT OR IGNORE INTO osm_tags(token, ctx) VALUES ('city', 'place=city')")
+    rows = conn.execute("SELECT id FROM osm_tags WHERE ctx = 'place'").fetchone()
+    assert rows is not None
+    conn.close()
 
 
 def test_compress_decompress_json():

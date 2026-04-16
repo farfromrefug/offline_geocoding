@@ -20,12 +20,13 @@ filtering are CPU-bound.  We therefore use a **producer–consumer** pattern:
 3. **Merge** (main process, after all workers finish)
    - The main process opens the final database and ATTACHes each worker
      database in turn.
-   - Strings and categories are inserted with ``INSERT OR IGNORE`` (the
-     UNIQUE constraint deduplicates by value/name).
-   - Temporary mapping tables (``_smap``, ``_cmap``, ``_pmap``) translate
-     worker-local IDs to the globally assigned IDs in the final database.
-   - Place names, addresses, categories, FTS data, and R-tree entries are
-     inserted using JOIN on those mapping tables.
+   - Strings, categories, and osm_tags are inserted with ``INSERT OR IGNORE``
+     (the UNIQUE constraint deduplicates by value/name/ctx).
+   - Temporary mapping tables (``_smap``, ``_cmap``, ``_tmap``, ``_pmap``)
+     translate worker-local IDs to the globally assigned IDs in the final
+     database.
+   - Place names, addresses, categories, osm_tags, FTS data, and R-tree
+     entries are inserted using JOIN on those mapping tables.
 
 ID consistency across databases
 --------------------------------
@@ -35,10 +36,10 @@ the final database are created with the same language list (and therefore the
 same ``build_lang_ids`` result), these IDs are identical everywhere — no
 remapping is needed for them during the merge step.
 
-Only ``strings`` (via ``_smap``) and ``categories`` (via ``_cmap``) need
-ID remapping.  ``places.osm_key_id``, ``places.osm_value_id``,
-``places.postcode_id``, and ``places.hn_id`` are string IDs and are also
-remapped via ``_smap``.
+Only ``strings`` (via ``_smap``), ``categories`` (via ``_cmap``), and
+``osm_tags`` (via ``_tmap``) need ID remapping.  ``places.postcode_id`` and
+``places.hn_id`` are string IDs remapped via ``_smap``.  ``places.osm_key_id``
+and ``places.osm_value_id`` are osm_tag IDs remapped via ``_tmap``.
 
 R-tree centroid-only storage
 -----------------------------
@@ -57,6 +58,19 @@ index is stored — the text content is NOT persisted in FTS5 shadow tables.
 Queries retrieve the matching ``rowid`` (which equals ``place_id``) and join
 ``places``.  Workers still use a plain ``fts_data`` staging table for
 efficient aggregation.
+
+The ``names`` column also includes raw category token strings and all their
+translated labels (from ``osm_tag_translations``), enabling queries like
+``"toto restaurant"`` or ``"toto natural peak"`` to match on category membership.
+
+OSM tag translations
+---------------------
+Tag translations are downloaded from
+``openstreetmap-tag-translations`` at import start (one JSON file per language).
+The main process downloads them and passes the combined
+``{lang: {ctx: label}}`` dict to each worker.  Workers write translated labels
+into ``osm_tag_names`` on first encounter of each tag token.  If downloads
+fail the import continues with raw (untranslated) tokens in the FTS index.
 """
 
 from __future__ import annotations
@@ -67,6 +81,7 @@ import logging
 import multiprocessing as mp
 import os
 import sqlite3
+import urllib.request
 from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
 try:
@@ -126,6 +141,12 @@ _PLACES_PER_WORKER = 50_000_000
 
 # Maximum number of parameters in a single SQLite statement.
 _SQL_PARAM_CHUNK = 900
+
+# URL template for openstreetmap-tag-translations JSON files.
+_TAG_TRANSLATIONS_URL = (
+    "https://raw.githubusercontent.com/plepe/openstreetmap-tag-translations"
+    "/refs/heads/master/tags/{lang}.json"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -275,6 +296,90 @@ def _parse_place_entry(
     }
 
 
+def _parse_category_parts(category: str) -> List[Tuple[str, str]]:
+    """Parse a photon category string into ``(token, ctx)`` pairs.
+
+    Each pair is suitable for inserting into ``osm_tags(token, ctx)``.
+
+    The ``ctx`` field serves as the translation-lookup key and is always
+    unique per (parent-key, token) combination:
+
+    * For the first part (the key / first significant token):
+      ``ctx == token``  →  lookup ``tag:{token}`` in translations.
+    * For subsequent parts (values under the previous token):
+      ``ctx == "{previous_token}={token}"``
+      →  lookup ``tag:{previous_token}={token}`` in translations.
+
+    The ``"osm"`` prefix used by Nominatim is discarded (it is just a
+    source group identifier, not a meaningful tag component).
+
+    Examples
+    --------
+    ``"osm.natural.peak"``  →  ``[("natural","natural"), ("peak","natural=peak")]``
+    ``"amenity.restaurant"`` →  ``[("amenity","amenity"), ("restaurant","amenity=restaurant")]``
+    ``"food.shop.supermarket"`` → ``[("food","food"), ("shop","food=shop"), ("supermarket","shop=supermarket")]``
+    """
+    parts = [p.strip() for p in category.split(".") if p.strip()]
+    if not parts:
+        return []
+    # Skip the Nominatim "osm" group prefix.
+    if parts[0] == "osm" and len(parts) > 1:
+        parts = parts[1:]
+    result: List[Tuple[str, str]] = []
+    for i, token in enumerate(parts):
+        if i == 0:
+            ctx = token
+        else:
+            ctx = f"{parts[i - 1]}={token}"
+        result.append((token, ctx))
+    return result
+
+
+def _fetch_tag_translations(lang: str) -> Dict[str, str]:
+    """Download OSM tag translations for *lang* from openstreetmap-tag-translations.
+
+    Returns a ``{ctx: translated_message}`` dict where *ctx* matches the
+    format produced by :func:`_parse_category_parts`:
+
+    * ``"natural"``       →  message for ``tag:natural``
+    * ``"natural=peak"``  →  message for ``tag:natural=peak``
+
+    Returns an empty dict if the download fails or *lang* is not found.
+    """
+    url = _TAG_TRANSLATIONS_URL.format(lang=lang)
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "offline-geocoding-importer"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        result: Dict[str, str] = {}
+        for key, val in data.items():
+            if not key.startswith("tag:") or not isinstance(val, dict):
+                continue
+            ctx = key[4:]  # strip "tag:" prefix  →  "natural" or "natural=peak"
+            msg = val.get("message")
+            if msg and isinstance(msg, str) and msg.strip():
+                result[ctx] = msg.strip()
+        log.debug("Fetched %d tag translations for lang=%s", len(result), lang)
+        return result
+    except Exception as exc:
+        log.warning("Could not fetch tag translations for '%s': %s", lang, exc)
+        return {}
+
+
+def _load_tag_translations(languages: List[str]) -> Dict[str, Dict[str, str]]:
+    """Download tag translations for all *languages*.
+
+    Returns ``{lang: {ctx: message}}``.  Missing languages are silently
+    omitted (empty dict for that language).
+    """
+    translations: Dict[str, Dict[str, str]] = {}
+    for lang in languages:
+        if lang == "default":
+            continue
+        translations[lang] = _fetch_tag_translations(lang)
+    return translations
+
+
 # ---------------------------------------------------------------------------
 # Worker-side string / category cache
 # ---------------------------------------------------------------------------
@@ -366,9 +471,104 @@ class _LocalCategoryCache:
                 self._cache[cat_name] = cid
 
 
-# ---------------------------------------------------------------------------
-# Worker-side write helpers
-# ---------------------------------------------------------------------------
+class _LocalOsmTagCache:
+    """Cache osm tag ``ctx`` → local integer id within a worker database.
+
+    Also writes translated labels into ``osm_tag_names`` on first encounter
+    of each tag token using the pre-fetched *translations* dict.
+    """
+
+    __slots__ = ("_conn", "_translations", "_lang_ids", "_strings", "_cache", "_translated")
+
+    def __init__(
+        self,
+        conn: sqlite3.Connection,
+        translations: Dict[str, Dict[str, str]],
+        lang_ids: Dict[str, int],
+        strings: _LocalStringCache,
+    ) -> None:
+        self._conn = conn
+        self._translations = translations  # {lang: {ctx: message}}
+        self._lang_ids = lang_ids
+        self._strings = strings
+        self._cache: Dict[str, int] = {}   # ctx -> tag_id
+        self._translated: Set[int] = set() # tag_ids already translated
+
+    def get_id(self, token: str, ctx: str) -> int:
+        """Intern a single tag token and return its local id.
+
+        Also writes ``osm_tag_names`` translations on first encounter.
+        """
+        tid = self._cache.get(ctx)
+        if tid is None:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO osm_tags(token, ctx) VALUES (?,?)", (token, ctx)
+            )
+            row = self._conn.execute(
+                "SELECT id FROM osm_tags WHERE ctx = ?", (ctx,)
+            ).fetchone()
+            tid = row[0]
+            self._cache[ctx] = tid
+            self._write_translations(tid, ctx)
+        return tid
+
+    def _write_translations(self, tag_id: int, ctx: str) -> None:
+        """Write ``osm_tag_names`` rows for all languages on first encounter."""
+        if tag_id in self._translated:
+            return
+        self._translated.add(tag_id)
+        labels: List[str] = []
+        for trans_dict in self._translations.values():
+            msg = trans_dict.get(ctx)
+            if msg:
+                labels.append(msg)
+        if not labels:
+            return
+        # Ensure translated strings are interned.
+        self._strings.intern_batch(labels)
+        rows: List[Tuple] = []
+        for lang, trans_dict in self._translations.items():
+            msg = trans_dict.get(ctx)
+            if not msg:
+                continue
+            lid = self._lang_ids.get(lang)
+            sid = self._strings._cache.get(msg)
+            if lid is not None and sid is not None:
+                rows.append((tag_id, sid, lid))
+        if rows:
+            self._conn.executemany(
+                "INSERT OR IGNORE INTO osm_tag_names(tag_id, string_id, lang_id)"
+                " VALUES (?,?,?)",
+                rows,
+            )
+
+    def intern_batch(self, token_ctx_pairs: List[Tuple[str, str]]) -> None:
+        """Intern a list of ``(token, ctx)`` pairs in bulk."""
+        missing = [(t, c) for t, c in token_ctx_pairs if c not in self._cache]
+        if not missing:
+            return
+        self._conn.executemany(
+            "INSERT OR IGNORE INTO osm_tags(token, ctx) VALUES (?,?)", missing
+        )
+        ctxs = [c for _, c in missing]
+        for i in range(0, len(ctxs), _SQL_PARAM_CHUNK):
+            chunk = ctxs[i : i + _SQL_PARAM_CHUNK]
+            placeholders = ",".join("?" * len(chunk))
+            rows_db = self._conn.execute(
+                f"SELECT ctx, id FROM osm_tags WHERE ctx IN ({placeholders})", chunk
+            ).fetchall()
+            for ctx, tid in rows_db:
+                self._cache[ctx] = tid
+                self._write_translations(tid, ctx)
+
+    def get_translated_labels(self, ctx: str) -> List[str]:
+        """Return all translated label strings for *ctx* (may be empty)."""
+        labels: List[str] = []
+        for trans_dict in self._translations.values():
+            msg = trans_dict.get(ctx)
+            if msg:
+                labels.append(msg)
+        return labels
 
 def _write_countries_worker(
     conn: sqlite3.Connection,
@@ -425,6 +625,7 @@ def _write_places_batch(
     parsed_places: List[Dict],
     strings: _LocalStringCache,
     cats: _LocalCategoryCache,
+    osm_tags: _LocalOsmTagCache,
     photon_to_db: Dict[str, Tuple[int, Optional[str], Optional[str]]],
     lang_ids: Dict[str, int],
     staging: bool = True,
@@ -473,24 +674,46 @@ def _write_places_batch(
     # ---- 2. Bulk-intern all strings and categories -------------------------
     all_strings: List[str] = []
     all_cat_names: List[str] = []
+    all_tag_pairs: List[Tuple[str, str]] = []  # (token, ctx) for osm_tags
+
     for place, all_addresses in zip(parsed_places, all_addresses_per_place):
         all_strings.extend(v for v, _l, _k in place["names"])
         all_strings.extend(v for _t, _l, v in all_addresses)
-        # Also intern the place's own TEXT fields that become string IDs.
-        for fld in ("osm_key", "osm_value", "postcode", "housenumber"):
+        # postcode and housenumber stay as string IDs.
+        for fld in ("postcode", "housenumber"):
             val = place.get(fld)
             if val:
                 all_strings.append(val)
         all_cat_names.extend(place["categories"])
+        # osm_key / osm_value go into osm_tags.
+        osm_key = place.get("osm_key")
+        osm_value = place.get("osm_value")
+        if osm_key:
+            all_tag_pairs.append((osm_key, osm_key))
+            if osm_value:
+                all_tag_pairs.append((osm_value, f"{osm_key}={osm_value}"))
+        # Category parts also go into osm_tags.
+        for cat in place["categories"]:
+            all_tag_pairs.extend(_parse_category_parts(cat))
 
     strings.intern_batch(list(dict.fromkeys(all_strings)))
     cats.intern_batch(list(dict.fromkeys(all_cat_names)))
+    # Dedup (token, ctx) pairs by ctx (the unique key) before bulk-intern.
+    seen_ctxs: Set[str] = set()
+    dedup_tag_pairs: List[Tuple[str, str]] = []
+    for token, ctx in all_tag_pairs:
+        if ctx not in seen_ctxs:
+            seen_ctxs.add(ctx)
+            dedup_tag_pairs.append((token, ctx))
+    osm_tags.intern_batch(dedup_tag_pairs)
 
     # ---- 3. Bulk-insert place rows ----------------------------------------
     place_rows: List[Tuple] = []
     for place in parsed_places:
-        osm_key_id   = strings._cache.get(place["osm_key"])   if place.get("osm_key")   else None
-        osm_value_id = strings._cache.get(place["osm_value"]) if place.get("osm_value") else None
+        osm_key = place.get("osm_key")
+        osm_value = place.get("osm_value")
+        osm_key_id   = osm_tags._cache.get(osm_key)           if osm_key   else None
+        osm_value_id = osm_tags._cache.get(f"{osm_key}={osm_value}") if osm_key and osm_value else None
         addr_type_id = ADDR_TYPE_IDS.get(place["address_type"]) if place.get("address_type") else None
         postcode_id  = strings._cache.get(place["postcode"])   if place.get("postcode")   else None
         hn_id        = strings._cache.get(place["housenumber"]) if place.get("housenumber") else None
@@ -522,14 +745,16 @@ def _write_places_batch(
     )
 
     # ---- 4. Bulk-insert child rows ----------------------------------------
-    name_rows:  List[Tuple] = []
-    addr_rows:  List[Tuple] = []
-    cat_rows:   List[Tuple] = []
-    fts_rows:   List[Tuple] = []
-    rtree_rows: List[Tuple] = []
+    name_rows:     List[Tuple] = []
+    addr_rows:     List[Tuple] = []
+    cat_rows:      List[Tuple] = []
+    osm_tag_rows:  List[Tuple] = []
+    fts_rows:      List[Tuple] = []
+    rtree_rows:    List[Tuple] = []
 
-    seen_pn: Set[Tuple] = set()
-    seen_pa: Set[Tuple] = set()
+    seen_pn:  Set[Tuple] = set()
+    seen_pa:  Set[Tuple] = set()
+    seen_pot: Set[Tuple] = set()
 
     for place, all_addresses in zip(parsed_places, all_addresses_per_place):
         pid = place["_place_id"]
@@ -561,12 +786,30 @@ def _write_places_batch(
             if cid is None:
                 continue
             cat_rows.append((pid, cid))
+            # Also add place_osm_tags entries for each part of this category.
+            for token, ctx in _parse_category_parts(cat):
+                tid = osm_tags._cache.get(ctx)
+                if tid is None:
+                    continue
+                key = (pid, tid)
+                if key not in seen_pot:
+                    seen_pot.add(key)
+                    osm_tag_rows.append(key)
 
-        fts_names = " ".join(sorted({v for v, _l, _k in place["names"]}))
+        # Build FTS names: place names + postcode + housenumber +
+        # raw category tokens + all their translated labels.
+        fts_name_tokens: Set[str] = {v for v, _l, _k in place["names"]}
         if place.get("postcode"):
-            fts_names += " " + place["postcode"]
+            fts_name_tokens.add(place["postcode"])
         if place.get("housenumber"):
-            fts_names += " " + place["housenumber"]
+            fts_name_tokens.add(place["housenumber"])
+        # Add raw tokens and translations for all category parts.
+        for cat in place["categories"]:
+            for token, ctx in _parse_category_parts(cat):
+                fts_name_tokens.add(token)
+                fts_name_tokens.update(osm_tags.get_translated_labels(ctx))
+        fts_names = " ".join(sorted(fts_name_tokens))
+
         fts_addr = " ".join(sorted({v for _t, _l, v in all_addresses}))
         fts_rows.append((pid, fts_names.strip(), fts_addr.strip()))
 
@@ -594,6 +837,11 @@ def _write_places_batch(
             "INSERT OR IGNORE INTO place_categories(place_id, category_id)"
             " VALUES (?,?)",
             cat_rows,
+        )
+    if osm_tag_rows:
+        conn.executemany(
+            "INSERT OR IGNORE INTO place_osm_tags(place_id, tag_id) VALUES (?,?)",
+            osm_tag_rows,
         )
     if fts_rows:
         if staging:
@@ -638,6 +886,7 @@ def _worker_main(
     poly_state: Optional[list],
     worker_id: int,
     place_id_base: int,
+    translations: Optional[Dict[str, Dict[str, str]]] = None,
 ) -> None:
     """Worker process: drain *work_queue* and write parsed results to *db_path*."""
     poly_filter: Optional[PolyFilter] = None
@@ -648,10 +897,13 @@ def _worker_main(
 
     lang_set: Set[str] = set(languages)
     lang_ids: Dict[str, int] = build_lang_ids(languages)
+    if translations is None:
+        translations = {}
 
     conn = create_worker_database(db_path, languages)
     strings = _LocalStringCache(conn)
     cats = _LocalCategoryCache(conn)
+    osm_tag_cache = _LocalOsmTagCache(conn, translations, lang_ids, strings)
     photon_to_db: Dict[str, Tuple[int, Optional[str], Optional[str]]] = {}
     local_counter = 0
 
@@ -708,14 +960,14 @@ def _worker_main(
         if parsed_places:
             try:
                 _write_places_batch(
-                    conn, parsed_places, strings, cats, photon_to_db, lang_ids
+                    conn, parsed_places, strings, cats, osm_tag_cache, photon_to_db, lang_ids
                 )
             except sqlite3.Error as exc:
                 log.warning("Worker %d batch write failed: %s", worker_id, exc)
                 for place in parsed_places:
                     try:
                         _write_places_batch(
-                            conn, [place], strings, cats, photon_to_db, lang_ids
+                            conn, [place], strings, cats, osm_tag_cache, photon_to_db, lang_ids
                         )
                     except sqlite3.Error as exc2:
                         log.debug(
@@ -744,7 +996,7 @@ def _merge_worker_db(
 
     Uses ATTACH DATABASE and SQL-driven temp mapping tables so that:
 
-    * ``strings`` and ``categories`` are globally deduplicated.
+    * ``strings``, ``categories``, and ``osm_tags`` are globally deduplicated.
     * ``countries`` are inserted by TEXT primary key (code); ``country_names``
       are upserted using remapped string IDs.
     * ``places`` receive new globally-sequential IDs via the ROW_NUMBER trick.
@@ -801,12 +1053,43 @@ def _merge_worker_db(
             "CREATE INDEX IF NOT EXISTS _idx_cmap_wid ON _cmap(wid)"
         )
 
-        # 4. Countries - INSERT OR IGNORE by TEXT primary key (no remap needed).
+        # 4. OSM tags - deduplicate by ctx (UNIQUE), build _tmap.
+        final_conn.execute(
+            "INSERT OR IGNORE INTO osm_tags(token, ctx) SELECT token, ctx FROM w.osm_tags"
+        )
+        final_conn.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS _tmap(wid INTEGER, fid INTEGER)"
+        )
+        final_conn.execute("DELETE FROM _tmap")
+        final_conn.execute(
+            """
+            INSERT INTO _tmap(wid, fid)
+            SELECT wt.id, mt.id
+            FROM w.osm_tags wt
+            JOIN main.osm_tags mt ON mt.ctx = wt.ctx
+            """
+        )
+        final_conn.execute(
+            "CREATE INDEX IF NOT EXISTS _idx_tmap_wid ON _tmap(wid)"
+        )
+
+        # 5. OSM tag names (translations) - remap tag_id via _tmap, string_id via _smap.
+        final_conn.execute(
+            """
+            INSERT OR IGNORE INTO osm_tag_names(tag_id, string_id, lang_id)
+            SELECT tm.fid, sm.fid, otn.lang_id
+            FROM w.osm_tag_names otn
+            JOIN _tmap tm ON tm.wid = otn.tag_id
+            JOIN _smap sm ON sm.wid = otn.string_id
+            """
+        )
+
+        # 6. Countries - INSERT OR IGNORE by TEXT primary key (no remap needed).
         final_conn.execute(
             "INSERT OR IGNORE INTO countries(code) SELECT code FROM w.countries"
         )
 
-        # 5. Metadata - upsert.
+        # 7. Metadata - upsert.
         final_conn.execute(
             """
             INSERT OR REPLACE INTO metadata(key, value)
@@ -814,7 +1097,7 @@ def _merge_worker_db(
             """
         )
 
-        # 6. Ensure all country_codes referenced by the worker's places exist.
+        # 8. Ensure all country_codes referenced by the worker's places exist.
         final_conn.execute(
             """
             INSERT OR IGNORE INTO countries(code)
@@ -824,7 +1107,7 @@ def _merge_worker_db(
             """
         )
 
-        # 7. Country names - remap string_id via _smap; lang_id is pre-seeded (no remap).
+        # 9. Country names - remap string_id via _smap; lang_id is pre-seeded (no remap).
         #    OR REPLACE to overwrite placeholder-only rows with real names.
         final_conn.execute(
             """
@@ -835,7 +1118,7 @@ def _merge_worker_db(
             """
         )
 
-        # 8. Places - insert without explicit id so SQLite assigns new sequential IDs.
+        # 10. Places - insert without explicit id so SQLite assigns new sequential IDs.
         base_row = final_conn.execute(
             "SELECT COALESCE(MAX(id), 0) FROM places"
         ).fetchone()
@@ -847,7 +1130,8 @@ def _merge_worker_db(
         worker_place_count: int = worker_count_row[0]
 
         if worker_place_count > 0:
-            # Remap string IDs for osm_key_id, osm_value_id, postcode_id, hn_id.
+            # Remap osm_key_id/osm_value_id via _tmap (osm_tags IDs).
+            # postcode_id and hn_id remapped via _smap (string IDs).
             # addr_type_id is pre-seeded (same IDs everywhere) – no remap.
             # lang_id / kind_id are also pre-seeded – no remap.
             final_conn.execute(
@@ -859,8 +1143,8 @@ def _merge_worker_db(
                 SELECT
                     wp.photon_id,
                     wp.osm_id,
-                    sk.fid,
-                    sv.fid,
+                    tk.fid,
+                    tv.fid,
                     wp.addr_type_id,
                     wp.importance,
                     wp.country_code,
@@ -870,15 +1154,15 @@ def _merge_worker_db(
                     wp.lon,
                     wp.extra
                 FROM w.places wp
-                LEFT JOIN _smap sk ON sk.wid = wp.osm_key_id
-                LEFT JOIN _smap sv ON sv.wid = wp.osm_value_id
+                LEFT JOIN _tmap tk ON tk.wid = wp.osm_key_id
+                LEFT JOIN _tmap tv ON tv.wid = wp.osm_value_id
                 LEFT JOIN _smap sp ON sp.wid = wp.postcode_id
                 LEFT JOIN _smap sh ON sh.wid = wp.hn_id
                 ORDER BY wp.id
                 """
             )
 
-            # 9. Place ID mapping using ROW_NUMBER.
+            # 11. Place ID mapping using ROW_NUMBER.
             final_conn.execute(
                 "CREATE TEMP TABLE IF NOT EXISTS _pmap(wid INTEGER, fid INTEGER)"
             )
@@ -899,7 +1183,7 @@ def _merge_worker_db(
                 "CREATE INDEX IF NOT EXISTS _idx_pmap_wid ON _pmap(wid)"
             )
 
-            # 10. place_names - remap place_id and string_id.
+            # 12. place_names - remap place_id and string_id.
             #     lang_id and kind_id are pre-seeded (no remap).
             final_conn.execute(
                 """
@@ -911,7 +1195,7 @@ def _merge_worker_db(
                 """
             )
 
-            # 11. place_addresses - remap place_id and string_id.
+            # 13. place_addresses - remap place_id and string_id.
             #     addr_type_id and lang_id are pre-seeded (no remap).
             final_conn.execute(
                 """
@@ -923,7 +1207,7 @@ def _merge_worker_db(
                 """
             )
 
-            # 12. place_categories - remap place_id and category_id.
+            # 14. place_categories - remap place_id and category_id.
             final_conn.execute(
                 """
                 INSERT OR IGNORE INTO place_categories(place_id, category_id)
@@ -934,7 +1218,18 @@ def _merge_worker_db(
                 """
             )
 
-            # 13. FTS5 (contentless) - rowid = place_id.
+            # 15. place_osm_tags - remap place_id via _pmap, tag_id via _tmap.
+            final_conn.execute(
+                """
+                INSERT OR IGNORE INTO place_osm_tags(place_id, tag_id)
+                SELECT pm.fid, tm.fid
+                FROM w.place_osm_tags pot
+                JOIN _pmap pm ON pm.wid = pot.place_id
+                JOIN _tmap tm ON tm.wid = pot.tag_id
+                """
+            )
+
+            # 16. FTS5 (contentless) - rowid = place_id.
             final_conn.execute(
                 """
                 INSERT INTO places_fts(rowid, names, address)
@@ -944,7 +1239,7 @@ def _merge_worker_db(
                 """
             )
 
-            # 14. R-tree - centroid point: min == max for both lat and lon.
+            # 17. R-tree - centroid point: min == max for both lat and lon.
             #     This always satisfies the R-tree constraint (min <= max).
             final_conn.execute(
                 f"""
@@ -1026,6 +1321,7 @@ def _import_single_thread(
     poly_file: Optional[str],
     batch_size: int,
     show_progress: bool,
+    translations: Optional[Dict[str, Dict[str, str]]] = None,
 ) -> None:
     """Import directly into the final database on a single thread."""
     poly_filter: Optional[PolyFilter] = None
@@ -1040,6 +1336,8 @@ def _import_single_thread(
 
     lang_set: Set[str] = set(languages)
     lang_ids: Dict[str, int] = build_lang_ids(languages)
+    if translations is None:
+        translations = {}
 
     if os.path.exists(output_path):
         os.unlink(output_path)
@@ -1055,6 +1353,7 @@ def _import_single_thread(
 
     strings = _LocalStringCache(conn)
     cats = _LocalCategoryCache(conn)
+    osm_tag_cache = _LocalOsmTagCache(conn, translations, lang_ids, strings)
     photon_to_db: Dict[str, Tuple[int, Optional[str], Optional[str]]] = {}
     total_places = 0
 
@@ -1112,7 +1411,7 @@ def _import_single_thread(
             if parsed_places:
                 try:
                     _write_places_batch(
-                        conn, parsed_places, strings, cats, photon_to_db,
+                        conn, parsed_places, strings, cats, osm_tag_cache, photon_to_db,
                         lang_ids, staging=False,
                     )
                 except sqlite3.Error as exc:
@@ -1120,7 +1419,7 @@ def _import_single_thread(
                     for place in parsed_places:
                         try:
                             _write_places_batch(
-                                conn, [place], strings, cats, photon_to_db,
+                                conn, [place], strings, cats, osm_tag_cache, photon_to_db,
                                 lang_ids, staging=False,
                             )
                         except sqlite3.Error as exc2:
@@ -1173,10 +1472,30 @@ def import_database(
     batch_size: int = _DEFAULT_BATCH,
     show_progress: bool = True,
     single_thread: bool = False,
+    fetch_translations: bool = True,
 ) -> None:
-    """Import a Photon JSONL(.zst) dump into *output_path*."""
+    """Import a Photon JSONL(.zst) dump into *output_path*.
+
+    Parameters
+    ----------
+    fetch_translations:
+        When ``True`` (default), tag translations are downloaded from the
+        ``openstreetmap-tag-translations`` project for each requested language
+        and stored in the database.  Set to ``False`` to skip translation
+        download (e.g. in offline or testing environments).
+    """
     if not languages:
         raise ValueError("At least one language must be specified.")
+
+    # Download tag translations once before spawning workers.
+    translations: Dict[str, Dict[str, str]] = {}
+    if fetch_translations:
+        log.info("Fetching OSM tag translations for languages: %s", languages)
+        translations = _load_tag_translations(languages)
+        log.info(
+            "Fetched tag translations: %s",
+            {lang: len(t) for lang, t in translations.items()},
+        )
 
     if single_thread:
         log.info("Single-thread mode: running import without worker processes.")
@@ -1187,6 +1506,7 @@ def import_database(
             poly_file=poly_file,
             batch_size=batch_size,
             show_progress=show_progress,
+            translations=translations,
         )
         return
 
@@ -1228,6 +1548,7 @@ def import_database(
                 poly_state,
                 i,
                 i * _PLACES_PER_WORKER,
+                translations,
             ),
             daemon=True,
         )

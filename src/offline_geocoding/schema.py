@@ -13,8 +13,12 @@ Design Goals
 * **Language-aware queries** – all name/address variants stored as rows in
   ``place_names`` / ``place_addresses`` with ``lang_id`` referencing the
   ``langs`` table.  Country names stored in ``country_names`` the same way.
+  OSM tag tokens (keys and values from categories) translated via
+  ``osm_tag_names`` and indexed in FTS5.
 * **Fast search** – FTS5 contentless table (no ``_content`` shadow table) with
   trigram tokeniser for fuzzy substring matching; R-tree for reverse geocoding.
+  Category tokens and their translations are included in the FTS ``names``
+  column so that ``"toto restaurant"`` or ``"toto natural peak"`` both work.
 
 Normalisation rules
 -------------------
@@ -25,8 +29,8 @@ Normalisation rules
   created with the same language list and the same pre-seeded tables, their
   IDs are **always identical** — no remapping is needed for these tables
   during the merge step.
-* Only ``strings`` (via ``_smap``) and ``categories`` (via ``_cmap``) need
-  ID remapping during merge.
+* ``strings`` (via ``_smap``), ``categories`` (via ``_cmap``), and
+  ``osm_tags`` (via ``_tmap``) need ID remapping during merge.
 
 Tables (final database)
 -----------------------
@@ -36,12 +40,15 @@ name_kinds       – interned name-kind strings ('name', 'alt', ...); pre-seeded
 addr_types       – interned address-type strings ('city', 'country', ...); pre-seeded
 strings          – interned text values; INTEGER PRIMARY KEY (AUTOINCREMENT)
 categories       – interned OSM category strings; INTEGER PRIMARY KEY
+osm_tags         – interned OSM tag tokens; id PK, token TEXT, ctx TEXT UNIQUE
+osm_tag_names    – localised labels for tag tokens; references osm_tags + strings + langs
 countries        – ISO country codes keyed by ``code TEXT PRIMARY KEY``
 country_names    – localised country names; references strings + langs
 places           – one row per photon place entry; normalised columns
 place_names      – N:M place ↔ string with lang_id + kind_id columns
 place_addresses  – N:M place ↔ string with addr_type_id + lang_id columns
 place_categories – N:M place ↔ category
+place_osm_tags   – N:M place ↔ osm_tag (all tokens from split categories)
 places_fts       – FTS5 contentless virtual table, trigram tokeniser
 places_rtree     – R-tree spatial index; stores centroid as (min==max) point
 
@@ -186,6 +193,29 @@ CREATE TABLE IF NOT EXISTS categories (
     name TEXT UNIQUE NOT NULL
 );
 
+-- Interned OSM tag tokens: individual parts from split categories.
+-- ``token`` is the raw string (e.g., "natural", "peak", "amenity").
+-- ``ctx`` is the translation lookup key and is UNIQUE:
+--   - for a key token: ctx == token  (e.g., "natural")
+--   - for a value token: ctx == "{parent_key}={token}"  (e.g., "natural=peak")
+-- Merge-remapped via ``_tmap`` (same pattern as strings / categories).
+CREATE TABLE IF NOT EXISTS osm_tags (
+    id    INTEGER PRIMARY KEY,
+    token TEXT NOT NULL,
+    ctx   TEXT UNIQUE NOT NULL
+);
+
+-- Localised (translated) labels for OSM tag tokens.
+-- ``string_id`` references strings(id): the translated label text.
+-- ``lang_id``   references langs(id).
+-- (tag_id, lang_id) PRIMARY KEY – one translation per language per token.
+CREATE TABLE IF NOT EXISTS osm_tag_names (
+    tag_id    INTEGER NOT NULL REFERENCES osm_tags(id),
+    string_id INTEGER NOT NULL REFERENCES strings(id),
+    lang_id   INTEGER NOT NULL REFERENCES langs(id),
+    PRIMARY KEY (tag_id, lang_id)
+);
+
 -- One row per country.
 -- ``code`` is the ISO 3166-1 alpha-2 code used as a natural key.
 -- Country names are stored in ``country_names`` (like place_names).
@@ -208,12 +238,14 @@ CREATE TABLE IF NOT EXISTS country_names (
 -- foreign keys wherever the cardinality is bounded.
 -- ``importance`` stored as round(value * IMPORTANCE_SCALE) (INTEGER).
 -- ``lat`` / ``lon`` stored as round(degrees * LAT_LON_SCALE) (INTEGER).
+-- ``osm_key_id`` / ``osm_value_id`` reference osm_tags(id), NOT strings(id).
+-- They share the same interning table as split category parts.
 CREATE TABLE IF NOT EXISTS places (
     id           INTEGER PRIMARY KEY,
     photon_id    TEXT,
     osm_id       INTEGER,
-    osm_key_id   INTEGER REFERENCES strings(id),
-    osm_value_id INTEGER REFERENCES strings(id),
+    osm_key_id   INTEGER REFERENCES osm_tags(id),
+    osm_value_id INTEGER REFERENCES osm_tags(id),
     addr_type_id INTEGER REFERENCES addr_types(id),
     importance   INTEGER NOT NULL DEFAULT 0,
     country_code TEXT    REFERENCES countries(code),
@@ -249,6 +281,14 @@ CREATE TABLE IF NOT EXISTS place_categories (
     place_id    INTEGER NOT NULL REFERENCES places(id)      ON DELETE CASCADE,
     category_id INTEGER NOT NULL REFERENCES categories(id),
     PRIMARY KEY (place_id, category_id)
+);
+
+-- OSM tag tokens assigned to a place (from split category parts).
+-- Enables efficient "filter by tag token" queries and drives FTS indexing.
+CREATE TABLE IF NOT EXISTS place_osm_tags (
+    place_id INTEGER NOT NULL REFERENCES places(id)  ON DELETE CASCADE,
+    tag_id   INTEGER NOT NULL REFERENCES osm_tags(id),
+    PRIMARY KEY (place_id, tag_id)
 );
 """
 
@@ -308,6 +348,10 @@ CREATE INDEX IF NOT EXISTS idx_place_names_lang  ON place_names(lang_id, kind_id
 CREATE INDEX IF NOT EXISTS idx_place_addr_place  ON place_addresses(place_id);
 CREATE INDEX IF NOT EXISTS idx_place_cat_place   ON place_categories(place_id);
 CREATE INDEX IF NOT EXISTS idx_country_names     ON country_names(code);
+CREATE INDEX IF NOT EXISTS idx_osm_tags_ctx       ON osm_tags(ctx);
+CREATE INDEX IF NOT EXISTS idx_osm_tag_names_tag  ON osm_tag_names(tag_id);
+CREATE INDEX IF NOT EXISTS idx_place_osm_tags_place ON place_osm_tags(place_id);
+CREATE INDEX IF NOT EXISTS idx_place_osm_tags_tag   ON place_osm_tags(tag_id);
 """
 
 
