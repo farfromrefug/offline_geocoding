@@ -393,6 +393,11 @@ CREATE TABLE IF NOT EXISTS rtree_data (
 # names/address text are NOT stored twice.  The trigram index (_data) is
 # built from the text passed during INSERT and is used for MATCH queries.
 # Queries retrieve the matching ``rowid`` (== place_id) and join ``places``.
+# NOTE: ``detail=none`` is intentionally NOT set here.  The trigram tokeniser
+# converts every query word into a sequence of 3-character trigram tokens;
+# FTS5 treats that sequence as a phrase and therefore requires per-token
+# position data.  Omitting position data (detail=none) would make all trigram
+# MATCH queries fail with "phrase queries are not supported (detail!=full)".
 _FTS = """
 CREATE VIRTUAL TABLE IF NOT EXISTS places_fts USING fts5(
     names,
@@ -421,15 +426,18 @@ CREATE INDEX IF NOT EXISTS idx_places_country    ON places(country_code);
 CREATE INDEX IF NOT EXISTS idx_places_osm        ON places(osm_id);
 CREATE INDEX IF NOT EXISTS idx_places_importance ON places(importance DESC);
 CREATE INDEX IF NOT EXISTS idx_places_grid_id    ON places(grid_id);
-CREATE INDEX IF NOT EXISTS idx_place_names_place ON place_names(place_id);
 CREATE INDEX IF NOT EXISTS idx_place_names_lang  ON place_names(lang_id, kind_id);
-CREATE INDEX IF NOT EXISTS idx_place_addr_place  ON place_addresses(place_id);
 CREATE INDEX IF NOT EXISTS idx_country_names     ON country_names(code);
 CREATE INDEX IF NOT EXISTS idx_osm_tags_ctx       ON osm_tags(ctx);
 CREATE INDEX IF NOT EXISTS idx_osm_tag_names_tag  ON osm_tag_names(tag_id);
 CREATE INDEX IF NOT EXISTS idx_place_osm_tags_place ON place_osm_tags(place_id);
 CREATE INDEX IF NOT EXISTS idx_place_osm_tags_tag   ON place_osm_tags(tag_id);
 """
+# Note: idx_place_names_place and idx_place_addr_place are intentionally
+# absent.  Both place_names and place_addresses have a composite PRIMARY KEY
+# whose leading column is place_id, so SQLite's implicit PK index already
+# satisfies ``WHERE place_id = ?`` lookups at full efficiency.  The explicit
+# secondary indices were redundant and cost ~9 MB on an 80 k-place database.
 
 
 # ---------------------------------------------------------------------------

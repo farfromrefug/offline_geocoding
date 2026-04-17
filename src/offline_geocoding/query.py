@@ -339,6 +339,49 @@ def _format_place(
 # Forward search (geocoding)
 # ---------------------------------------------------------------------------
 
+def _run_fts_search(
+    conn: sqlite3.Connection,
+    fts_query: str,
+    languages: Optional[List[str]],
+    bbox: Optional[Tuple[float, float, float, float]],
+    limit: int,
+    offset: int,
+) -> List[Dict[str, Any]]:
+    """Execute a pre-built FTS5 MATCH query and format results."""
+    if bbox is not None:
+        min_lon, min_lat, max_lon, max_lat = bbox
+        sql = """
+            SELECT p.*
+            FROM places_fts fts
+            JOIN places p ON p.id = fts.rowid
+            WHERE places_fts MATCH ?
+              AND p.lat BETWEEN ? AND ?
+              AND p.lon BETWEEN ? AND ?
+            ORDER BY fts.rank, p.importance DESC
+            LIMIT ? OFFSET ?
+        """
+        params: tuple = (
+            fts_query,
+            round(min_lat * LAT_LON_SCALE), round(max_lat * LAT_LON_SCALE),
+            round(min_lon * LAT_LON_SCALE), round(max_lon * LAT_LON_SCALE),
+            limit, offset,
+        )
+    else:
+        sql = """
+            SELECT p.*
+            FROM places_fts fts
+            JOIN places p ON p.id = fts.rowid
+            WHERE places_fts MATCH ?
+            ORDER BY fts.rank, p.importance DESC
+            LIMIT ? OFFSET ?
+        """
+        params = (fts_query, limit, offset)
+
+    rows = conn.execute(sql, params).fetchall()
+    country_cache: Dict[str, Optional[str]] = {}
+    return [_format_place(conn, r, languages, country_cache) for r in rows]
+
+
 def search(
     db: _DbArg,
     query: str,
@@ -378,39 +421,11 @@ def search(
     conn, should_close = _conn(db)
     try:
         fts_query = _escape_fts(query)
-
-        if bbox is not None:
-            min_lon, min_lat, max_lon, max_lat = bbox
-            sql = """
-                SELECT p.*
-                FROM places_fts fts
-                JOIN places p ON p.id = fts.rowid
-                WHERE places_fts MATCH ?
-                  AND p.lat BETWEEN ? AND ?
-                  AND p.lon BETWEEN ? AND ?
-                ORDER BY fts.rank, p.importance DESC
-                LIMIT ? OFFSET ?
-            """
-            params = (
-                fts_query,
-                round(min_lat * LAT_LON_SCALE), round(max_lat * LAT_LON_SCALE),
-                round(min_lon * LAT_LON_SCALE), round(max_lon * LAT_LON_SCALE),
-                limit, offset,
-            )
-        else:
-            sql = """
-                SELECT p.*
-                FROM places_fts fts
-                JOIN places p ON p.id = fts.rowid
-                WHERE places_fts MATCH ?
-                ORDER BY fts.rank, p.importance DESC
-                LIMIT ? OFFSET ?
-            """
-            params = (fts_query, limit, offset)
-
-        rows = conn.execute(sql, params).fetchall()
-        country_cache: Dict[str, Optional[str]] = {}
-        return [_format_place(conn, r, languages, country_cache) for r in rows]
+        if not fts_query:
+            return []
+        return _run_fts_search(
+            conn, fts_query, languages, bbox, limit, offset
+        )
     finally:
         if should_close:
             conn.close()
@@ -428,14 +443,19 @@ def search_column(
     """FTS search restricted to a single FTS column (``'names'`` or ``'address'``)."""
     if column not in ("names", "address"):
         raise ValueError("column must be 'names' or 'address'")
-    return search(
-        db,
-        f"{column}:{_escape_fts(query)}",
-        languages=languages,
-        bbox=bbox,
-        limit=limit,
-        offset=offset,
-    )
+    if not query or not query.strip():
+        return []
+    conn, should_close = _conn(db)
+    try:
+        fts_query = _escape_fts_column(query, column)
+        if not fts_query:
+            return []
+        return _run_fts_search(
+            conn, fts_query, languages, bbox, limit, offset
+        )
+    finally:
+        if should_close:
+            conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -520,17 +540,54 @@ def reverse(
 # Utility
 # ---------------------------------------------------------------------------
 
-def _escape_fts(query: str) -> str:
-    """Wrap *query* in double-quotes to prevent FTS5 syntax errors.
+def _fts_tokens(query: str) -> List[str]:
+    """Normalise *query* and split into safe FTS5 term tokens.
 
-    Diacritical marks are stripped via Unicode NFD decomposition before
-    building the query, so that ``"elysee"`` matches ``"Élysées"`` in the
-    trigram index (where names are also stored without diacritics).
+    Steps
+    -----
+    1. Strip diacritical marks (``normalize_for_fts``).
+    2. Replace characters that have special meaning in the FTS5 query syntax
+       (``"  *  (  )  +  ^  :  -``) with spaces.  This prevents syntax errors
+       and correctly handles place names that contain hyphens (e.g.
+       ``"Saint-Germain"`` becomes the two AND-matched terms ``Saint`` and
+       ``Germain``).
+    3. Split on whitespace and return the non-empty tokens.
     """
-    clean = normalize_for_fts(query).replace('"', ' ').strip()
-    if not clean:
-        return '""'
-    return f'"{clean}"'
+    clean = normalize_for_fts(query)
+    # str.translate is efficient for character-level replacements.
+    clean = clean.translate(str.maketrans('"*()+^:-', '        ')).strip()
+    return clean.split()
+
+
+def _escape_fts(query: str) -> str:
+    """Build an FTS5 MATCH expression from *query* (all columns, implicit AND).
+
+    Each whitespace-separated word is translated to a bare FTS5 term (no
+    surrounding quotes) and joined with spaces, which in FTS5 means all terms
+    must be present (implicit AND).  This produces better geocoding results
+    than a single quoted phrase because terms may appear in any order and at
+    any position within the indexed text.
+
+    FTS5-special characters (``"  *  (  )  +  ^  :  -``) are replaced with
+    spaces before splitting, so that place names containing hyphens (e.g.
+    ``"Saint-Germain"``) are matched correctly, and user input can never inject
+    unexpected FTS5 query syntax.
+
+    Diacritical marks are stripped via Unicode NFD decomposition so that
+    ``"elysee"`` matches ``"Élysées"`` in the trigram index.
+    """
+    tokens = _fts_tokens(query)
+    return " ".join(tokens) if tokens else ""
+
+
+def _escape_fts_column(query: str, column: str) -> str:
+    """Build an FTS5 MATCH expression restricted to *column*.
+
+    Each token from *query* is prefixed with ``{column}:`` so the column
+    filter applies independently to every term (implicit AND).
+    """
+    tokens = _fts_tokens(query)
+    return " ".join(f"{column}:{t}" for t in tokens) if tokens else ""
 
 
 def get_languages(db: _DbArg) -> List[str]:

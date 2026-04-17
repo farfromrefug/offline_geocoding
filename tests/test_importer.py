@@ -305,9 +305,17 @@ def test_import_basic(tmp_path):
     rt_count = conn.execute("SELECT COUNT(*) FROM places_rtree").fetchone()[0]
     assert rt_count == 2
 
-    # FTS entries.
-    fts_count = conn.execute("SELECT COUNT(*) FROM places_fts").fetchone()[0]
-    assert fts_count == 2
+    # FTS entries: verify both places are findable by name via MATCH.
+    # COUNT(*) is not supported on contentless FTS5 tables.
+    # With detail=none, bare terms must be used (no quoted phrase syntax).
+    paris_fts = conn.execute(
+        "SELECT rowid FROM places_fts WHERE places_fts MATCH 'Paris'"
+    ).fetchall()
+    eiffel_fts = conn.execute(
+        "SELECT rowid FROM places_fts WHERE places_fts MATCH 'Eiffel'"
+    ).fetchall()
+    assert len(paris_fts) >= 1, "Paris not found in FTS"
+    assert len(eiffel_fts) >= 1, "Eiffel not found in FTS"
 
     # Categories no longer exist as a table; osm_tags holds the tag tokens.
     # Verify place_osm_tags has entries for category-derived tags.
@@ -512,7 +520,9 @@ def test_import_single_thread_mode(tmp_path):
     conn.row_factory = sqlite3.Row
 
     assert conn.execute("SELECT COUNT(*) FROM places").fetchone()[0] == 2
-    assert conn.execute("SELECT COUNT(*) FROM places_fts").fetchone()[0] == 2
+    assert conn.execute(
+        "SELECT rowid FROM places_fts WHERE places_fts MATCH 'Paris'"
+    ).fetchone() is not None, "Paris not found in FTS"
     assert conn.execute("SELECT COUNT(*) FROM places_rtree").fetchone()[0] == 2
 
     # lat/lon stored as INTEGER (×1_000_000); verify the stored type.
