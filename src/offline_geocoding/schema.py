@@ -512,6 +512,10 @@ _INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_places_country    ON places(country_code);
 CREATE INDEX IF NOT EXISTS idx_places_osm        ON places(osm_id);
 CREATE INDEX IF NOT EXISTS idx_places_importance ON places(importance DESC);
+-- idx_places_grid_id is required by the reverse-geocoding query in query.py:
+--   JOIN places p ON p.grid_id = rt.id
+-- where rt.id comes from the R-tree scan.  SQLite cannot use the R-tree result
+-- set as the driving index for the places table without this secondary index.
 CREATE INDEX IF NOT EXISTS idx_places_grid_id    ON places(grid_id);
 """
 # Indexes intentionally NOT created (reasons):

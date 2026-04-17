@@ -5,10 +5,13 @@ open :class:`sqlite3.Connection`.
 
 Search (geocoding)
 ------------------
-Uses the FTS5 ``places_fts`` virtual table (contentless, trigram tokeniser)
-for fast fuzzy substring matching.  Matches return ``rowid`` (== ``place_id``)
-which is joined to ``places``.  An optional bounding box restricts results
-geographically.
+Uses the FTS5 ``places_fts`` virtual table (contentless, pre-computed trigrams
+with ``detail=none``) for fast fuzzy substring matching.  Trigrams are
+pre-computed in Python at both index time (importer) and query time (here via
+``_escape_fts``) so that position data is not needed and the FTS index stays
+~80% smaller than with the built-in trigram tokeniser.  Matches return
+``rowid`` (== ``place_id``) which is joined to ``places``.  An optional
+bounding box restricts results geographically.
 
 Reverse geocoding
 -----------------
