@@ -16,7 +16,7 @@ search, R-tree reverse geocoding, low memory footprint during import.
 | **Language support** | CLI-defined list; filters OSM `name:xx` tags accordingly |
 | **Name deduplication** | Shared `strings` table; no repeated text blobs |
 | **Country/category dedup** | Dedicated `countries` and `categories` tables |
-| **Fuzzy full-text search** | FTS5 with pre-computed trigrams (`detail=none`, ~80% smaller than built-in trigram tokeniser) |
+| **Fuzzy full-text search** | FTS5 with SQLite's built-in **trigram** tokeniser |
 | **Reverse geocoding** | Virtual R-tree spatial index |
 | **BBox filter on search** | Combine FTS5 results with lat/lon bounding box |
 | **Extra tags** | Stored as gzip-compressed JSON BLOB |
@@ -138,7 +138,7 @@ places            – one row per photon place entry
 place_names       – N:M place ↔ string, with lang + kind columns
 place_addresses   – N:M place ↔ string, with addr_type + lang columns
 place_categories  – N:M place ↔ category
-places_fts        – FTS5 virtual table (pre-computed trigrams, ascii tokeniser, detail=none)
+places_fts        – FTS5 virtual table (trigram, case-insensitive)
 places_rtree      – R-tree spatial index
 ```
 

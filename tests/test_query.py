@@ -183,6 +183,27 @@ def test_search_no_results(db_path):
     assert results == []
 
 
+def test_search_trigram_no_false_positives(db_path):
+    """'parc' must not match 'Arc de Triomphe' via shared trigrams 'par'+'arc'.
+
+    This is a regression guard against the pre-computed-trigrams+detail=none
+    approach that was tried as a size optimisation: without position data, the
+    AND of the two trigrams in "parc" ("par" from "Paris" in the address and
+    "arc" from "Arc" in the name) produced false-positive matches.  The built-in
+    trigram tokeniser enforces adjacency via position lists, preventing this.
+    """
+    # The fixture DB contains "Paris" and "Eiffel Tower".  Neither has "parc"
+    # as a substring, so the query should return no results.
+    results = search(db_path, "parc", limit=10)
+    names = [r.get("name", "") for r in results]
+    assert not any("Paris" in (n or "") for n in names), (
+        f"'parc' falsely matched Paris-related place: {names}"
+    )
+    assert not any("Eiffel" in (n or "") for n in names), (
+        f"'parc' falsely matched Eiffel-related place: {names}"
+    )
+
+
 def test_search_bbox_filter(db_path):
     """Bounding box restricts results geographically."""
     # bbox covering only Paris area.

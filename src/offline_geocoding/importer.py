@@ -108,7 +108,6 @@ from .schema import (
     create_indexes,
     create_worker_database,
     normalize_for_fts,
-    text_to_fts_trigrams,
 )
 
 log = logging.getLogger(__name__)
@@ -891,7 +890,7 @@ def _write_places_batch(
         fts_addr = " ".join(sorted(
             {normalize_for_fts(v) for _t, _l, v in all_addresses}
         ))
-        fts_rows.append((pid, text_to_fts_trigrams(fts_names.strip()), text_to_fts_trigrams(fts_addr.strip())))
+        fts_rows.append((pid, fts_names.strip(), fts_addr.strip()))
 
         # R-tree grid cell or per-place point (when no grid).
         lat_int = round(place["lat"] * LAT_LON_SCALE)

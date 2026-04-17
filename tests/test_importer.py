@@ -25,7 +25,6 @@ from offline_geocoding.schema import (
     build_lang_ids,
     create_database,
     create_worker_database,
-    text_to_fts_trigrams,
 )
 
 
@@ -307,15 +306,13 @@ def test_import_basic(tmp_path):
     assert rt_count == 2
 
     # FTS entries: verify both places are findable by name via MATCH.
-    # The FTS table stores pre-computed trigrams; the MATCH query must use the
-    # same trigram expansion (via text_to_fts_trigrams).
+    # The trigram tokeniser converts each search word into overlapping 3-char
+    # tokens and verifies their adjacency using position data (detail=full).
     paris_fts = conn.execute(
-        "SELECT rowid FROM places_fts WHERE places_fts MATCH ?",
-        (text_to_fts_trigrams("paris"),),
+        "SELECT rowid FROM places_fts WHERE places_fts MATCH 'Paris'"
     ).fetchall()
     eiffel_fts = conn.execute(
-        "SELECT rowid FROM places_fts WHERE places_fts MATCH ?",
-        (text_to_fts_trigrams("eiffel"),),
+        "SELECT rowid FROM places_fts WHERE places_fts MATCH 'Eiffel'"
     ).fetchall()
     assert len(paris_fts) >= 1, "Paris not found in FTS"
     assert len(eiffel_fts) >= 1, "Eiffel not found in FTS"
@@ -524,8 +521,7 @@ def test_import_single_thread_mode(tmp_path):
 
     assert conn.execute("SELECT COUNT(*) FROM places").fetchone()[0] == 2
     assert conn.execute(
-        "SELECT rowid FROM places_fts WHERE places_fts MATCH ?",
-        (text_to_fts_trigrams("paris"),),
+        "SELECT rowid FROM places_fts WHERE places_fts MATCH 'Paris'"
     ).fetchone() is not None, "Paris not found in FTS"
     assert conn.execute("SELECT COUNT(*) FROM places_rtree").fetchone()[0] == 2
 

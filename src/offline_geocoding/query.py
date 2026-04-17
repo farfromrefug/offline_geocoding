@@ -5,13 +5,10 @@ open :class:`sqlite3.Connection`.
 
 Search (geocoding)
 ------------------
-Uses the FTS5 ``places_fts`` virtual table (contentless, pre-computed trigrams
-with ``detail=none``) for fast fuzzy substring matching.  Trigrams are
-pre-computed in Python at both index time (importer) and query time (here via
-``_escape_fts``) so that position data is not needed and the FTS index stays
-~80% smaller than with the built-in trigram tokeniser.  Matches return
-``rowid`` (== ``place_id``) which is joined to ``places``.  An optional
-bounding box restricts results geographically.
+Uses the FTS5 ``places_fts`` virtual table (contentless, trigram tokeniser)
+for fast fuzzy substring matching.  Matches return ``rowid`` (== ``place_id``)
+which is joined to ``places``.  An optional bounding box restricts results
+geographically.
 
 Reverse geocoding
 -----------------
@@ -51,7 +48,6 @@ from .schema import (
     NAME_KIND_IDS,
     apply_pragmas,
     normalize_for_fts,
-    text_to_fts_trigrams,
 )
 
 # ---------------------------------------------------------------------------
@@ -566,37 +562,32 @@ def _fts_tokens(query: str) -> List[str]:
 def _escape_fts(query: str) -> str:
     """Build an FTS5 MATCH expression from *query* (all columns, implicit AND).
 
-    The FTS5 table stores pre-computed trigrams (via ``text_to_fts_trigrams``
-    at index time).  The query must go through the same transformation so that
-    the MATCH tokens align with the stored tokens.
+    Each whitespace-separated word is translated to a bare FTS5 term (no
+    surrounding quotes) and joined with spaces, which in FTS5 means all terms
+    must be present (implicit AND).  This produces better geocoding results
+    than a single quoted phrase because terms may appear in any order and at
+    any position within the indexed text.
 
-    Steps
-    -----
-    1. Normalise: strip diacritics, replace FTS5-special characters
-       (``"  *  (  )  +  ^  :  -``) with spaces.
-    2. Convert the resulting normalised words to their trigrams.
-    3. Join all trigrams with spaces → FTS5 implicit AND over all of them.
+    FTS5-special characters (``"  *  (  )  +  ^  :  -``) are replaced with
+    spaces before splitting, so that place names containing hyphens (e.g.
+    ``"Saint-Germain"``) are matched correctly, and user input can never inject
+    unexpected FTS5 query syntax.
 
-    Example
-    -------
-    ``"Saint-Germain"``
-    → strip hyphen → ``"saint germain"``
-    → trigrams → ``"sai ain int ger erm rma mai ain"``
-    → FTS MATCH finds documents containing ALL eight trigram tokens.
+    Diacritical marks are stripped via Unicode NFD decomposition so that
+    ``"elysee"`` matches ``"Élysées"`` in the trigram index.
     """
     tokens = _fts_tokens(query)
-    return text_to_fts_trigrams(" ".join(tokens))
+    return " ".join(tokens) if tokens else ""
 
 
 def _escape_fts_column(query: str, column: str) -> str:
     """Build an FTS5 MATCH expression restricted to *column*.
 
-    Each trigram token from *query* is prefixed with ``{column}:`` so the
-    column filter applies independently to every trigram (implicit AND).
+    Each token from *query* is prefixed with ``{column}:`` so the column
+    filter applies independently to every term (implicit AND).
     """
     tokens = _fts_tokens(query)
-    trigrams = text_to_fts_trigrams(" ".join(tokens)).split()
-    return " ".join(f"{column}:{t}" for t in trigrams) if trigrams else ""
+    return " ".join(f"{column}:{t}" for t in tokens) if tokens else ""
 
 
 def get_languages(db: _DbArg) -> List[str]:

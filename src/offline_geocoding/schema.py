@@ -103,62 +103,6 @@ def normalize_for_fts(text: str) -> str:
         if unicodedata.category(c) != "Mn"
     )
 
-
-def text_to_fts_trigrams(text: str) -> str:
-    """Convert *text* to space-separated trigrams for pre-computed FTS indexing.
-
-    This function is the key enabler for using ``detail=none`` (no per-token
-    position lists) on the FTS5 table despite using trigram-style matching.
-    The trick is to pre-compute the trigrams at index and query time in Python
-    rather than relying on the built-in trigram tokeniser.
-
-    Why this works
-    ~~~~~~~~~~~~~~
-    SQLite's built-in ``trigram`` tokeniser needs position data (``detail=full``)
-    because it converts a query word like ``"Paris"`` into the trigram sequence
-    ``par, ari, ris`` and then uses position data to verify adjacency.  With
-    ``detail=none`` SQLite only stores *which documents* contain a token, not
-    *where* in the document — enough for a set-membership AND query but not
-    enough for phrase ordering.
-
-    Pre-computing the trigrams ourselves and storing them as plain
-    space-separated tokens (e.g. ``"par ari ris"``) lets us use the lightweight
-    ``ascii`` tokeniser with ``detail=none``:
-
-    * At index time  the document ``"Paris"`` becomes ``"par ari ris"``.
-    * At query time  the query  ``"paris"`` also becomes ``"par ari ris"``.
-    * FTS5 checks that *all* trigram tokens appear in the document — equivalent
-      to the positional phrase check, because false positives are extremely
-      unlikely when all N trigrams must match.
-
-    The result is typically **~80% smaller** than the same data stored with the
-    built-in trigram tokeniser (position lists dominate the ``_data`` shadow
-    table).
-
-    Algorithm
-    ~~~~~~~~~
-    1. Lowercase the text (for case-insensitive matching at query time).
-    2. For each whitespace-separated word:
-
-       * If the word has 3+ characters, emit all overlapping 3-char substrings.
-       * If the word is shorter than 3 characters, emit the word as-is (exact
-         token match).
-    3. Join with spaces.
-
-    Note
-    ~~~~
-    Callers are responsible for stripping diacritics (via ``normalize_for_fts``)
-    *before* calling this function so that ``"élysées"`` and ``"elysees"``
-    produce identical trigrams.
-    """
-    parts: List[str] = []
-    for word in text.lower().split():
-        if len(word) >= 3:
-            parts.extend(word[i:i + 3] for i in range(len(word) - 2))
-        elif word:
-            parts.append(word)
-    return " ".join(parts)
-
 # ---------------------------------------------------------------------------
 # Storage scale constants
 # ---------------------------------------------------------------------------
@@ -462,35 +406,25 @@ CREATE TABLE IF NOT EXISTS rtree_data (
 # built from the text passed during INSERT and is used for MATCH queries.
 # Queries retrieve the matching ``rowid`` (== place_id) and join ``places``.
 #
-# WHY pre-computed trigrams with ascii + detail=none instead of the built-in
-# trigram tokeniser with detail=full:
+# ``detail=none`` (no per-token position lists) is intentionally NOT used here.
+# The trigram tokeniser converts every query word into a sequence of overlapping
+# 3-char tokens and FTS5 verifies their adjacency via position data (phrase
+# match).  Without position data (detail=none), ALL trigram MATCH queries fail
+# with "phrase queries are not supported (detail!=full)".
 #
-#   The built-in ``trigram`` tokeniser requires ``detail=full`` because it
-#   converts every query word into a sequence of overlapping 3-char tokens and
-#   then uses per-token position data to verify that the tokens appear
-#   adjacently (phrase matching).  Omitting position data (``detail=none``)
-#   makes ALL trigram MATCH queries fail with "phrase queries are not supported
-#   (detail!=full)".
-#
-#   The workaround is to pre-compute the trigrams in Python (via
-#   ``text_to_fts_trigrams()``) and store them as space-separated tokens
-#   before INSERT.  The plain ``ascii`` tokeniser then treats each trigram as
-#   an independent term.  A search for ``"Paris"`` generates the query tokens
-#   ``par AND ari AND ris``; FTS5 finds all documents that contain all three
-#   tokens — semantically identical to the phrase match but without position
-#   data.  This reduces the ``places_fts_data`` shadow table by ~80%.
-#
-#   ``detail=none`` stores only the set of document IDs per token (no
-#   positions); ``columnsize=0`` skips the ``places_fts_docsize`` shadow table
-#   (saves ~1 additional page per thousand places).
+# A pre-computed approach (generate trigrams in Python, store as plain tokens,
+# use ascii tokeniser + detail=none) was tried but produces unacceptable false
+# positives: short words generate only 1–2 trigrams that can appear in unrelated
+# documents when those trigrams happen to be substrings of different words
+# (e.g. "parc" → "par"+"arc"; both appear in a doc with "Arc de Triomphe"
+# as name and "Paris" as address → wrong match).  Position data is the ONLY
+# reliable way to enforce that the trigrams come from the same word.
 _FTS = """
 CREATE VIRTUAL TABLE IF NOT EXISTS places_fts USING fts5(
     names,
     address,
     content='',
-    tokenize = 'ascii',
-    detail    = none,
-    columnsize = 0
+    tokenize = 'trigram case_sensitive 0'
 );
 """
 
@@ -553,12 +487,12 @@ CREATE INDEX IF NOT EXISTS idx_places_grid_id    ON places(grid_id);
 # ---------------------------------------------------------------------------
 
 def _check_sqlite_version() -> None:
-    """Raise ``RuntimeError`` if SQLite is too old for FTS5 with ``detail=none``."""
+    """Raise ``RuntimeError`` if SQLite is too old for the trigram tokeniser."""
     sqlite_ver = tuple(int(x) for x in sqlite3.sqlite_version.split("."))
     if sqlite_ver < (3, 34, 0):
         raise RuntimeError(
-            f"SQLite {sqlite3.sqlite_version} does not support FTS5 with "
-            "detail=none. Please upgrade to SQLite >= 3.34.0."
+            f"SQLite {sqlite3.sqlite_version} does not support the FTS5 trigram "
+            "tokeniser. Please upgrade to SQLite >= 3.34.0."
         )
 
 
