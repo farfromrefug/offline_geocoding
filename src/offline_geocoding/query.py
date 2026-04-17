@@ -48,6 +48,7 @@ from .schema import (
     NAME_KIND_IDS,
     apply_pragmas,
     normalize_for_fts,
+    text_to_fts_trigrams,
 )
 
 # ---------------------------------------------------------------------------
@@ -562,32 +563,37 @@ def _fts_tokens(query: str) -> List[str]:
 def _escape_fts(query: str) -> str:
     """Build an FTS5 MATCH expression from *query* (all columns, implicit AND).
 
-    Each whitespace-separated word is translated to a bare FTS5 term (no
-    surrounding quotes) and joined with spaces, which in FTS5 means all terms
-    must be present (implicit AND).  This produces better geocoding results
-    than a single quoted phrase because terms may appear in any order and at
-    any position within the indexed text.
+    The FTS5 table stores pre-computed trigrams (via ``text_to_fts_trigrams``
+    at index time).  The query must go through the same transformation so that
+    the MATCH tokens align with the stored tokens.
 
-    FTS5-special characters (``"  *  (  )  +  ^  :  -``) are replaced with
-    spaces before splitting, so that place names containing hyphens (e.g.
-    ``"Saint-Germain"``) are matched correctly, and user input can never inject
-    unexpected FTS5 query syntax.
+    Steps
+    -----
+    1. Normalise: strip diacritics, replace FTS5-special characters
+       (``"  *  (  )  +  ^  :  -``) with spaces.
+    2. Convert the resulting normalised words to their trigrams.
+    3. Join all trigrams with spaces → FTS5 implicit AND over all of them.
 
-    Diacritical marks are stripped via Unicode NFD decomposition so that
-    ``"elysee"`` matches ``"Élysées"`` in the trigram index.
+    Example
+    -------
+    ``"Saint-Germain"``
+    → strip hyphen → ``"saint germain"``
+    → trigrams → ``"sai ain int ger erm rma mai ain"``
+    → FTS MATCH finds documents containing ALL eight trigram tokens.
     """
     tokens = _fts_tokens(query)
-    return " ".join(tokens) if tokens else ""
+    return text_to_fts_trigrams(" ".join(tokens))
 
 
 def _escape_fts_column(query: str, column: str) -> str:
     """Build an FTS5 MATCH expression restricted to *column*.
 
-    Each token from *query* is prefixed with ``{column}:`` so the column
-    filter applies independently to every term (implicit AND).
+    Each trigram token from *query* is prefixed with ``{column}:`` so the
+    column filter applies independently to every trigram (implicit AND).
     """
     tokens = _fts_tokens(query)
-    return " ".join(f"{column}:{t}" for t in tokens) if tokens else ""
+    trigrams = text_to_fts_trigrams(" ".join(tokens)).split()
+    return " ".join(f"{column}:{t}" for t in trigrams) if trigrams else ""
 
 
 def get_languages(db: _DbArg) -> List[str]:
