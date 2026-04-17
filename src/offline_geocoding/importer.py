@@ -20,13 +20,12 @@ filtering are CPU-bound.  We therefore use a **producer–consumer** pattern:
 3. **Merge** (main process, after all workers finish)
    - The main process opens the final database and ATTACHes each worker
      database in turn.
-   - Strings, categories, and osm_tags are inserted with ``INSERT OR IGNORE``
-     (the UNIQUE constraint deduplicates by value/name/ctx).
-   - Temporary mapping tables (``_smap``, ``_cmap``, ``_tmap``, ``_pmap``)
-     translate worker-local IDs to the globally assigned IDs in the final
-     database.
-   - Place names, addresses, categories, osm_tags, FTS data, and R-tree
-     entries are inserted using JOIN on those mapping tables.
+   - Strings and osm_tags are inserted with ``INSERT OR IGNORE``
+     (the UNIQUE constraint deduplicates by value/ctx).
+   - Temporary mapping tables (``_smap``, ``_tmap``) translate worker-local
+     IDs to the globally assigned IDs in the final database.
+   - Place names, addresses, osm_tags, FTS data, and R-tree entries are
+     inserted using JOIN on those mapping tables.
 
 ID consistency across databases
 --------------------------------
@@ -36,20 +35,21 @@ the final database are created with the same language list (and therefore the
 same ``build_lang_ids`` result), these IDs are identical everywhere — no
 remapping is needed for them during the merge step.
 
-Only ``strings`` (via ``_smap``), ``categories`` (via ``_cmap``), and
-``osm_tags`` (via ``_tmap``) need ID remapping.  ``places.postcode_id`` and
-``places.hn_id`` are string IDs remapped via ``_smap``.  ``places.osm_key_id``
-and ``places.osm_value_id`` are osm_tag IDs remapped via ``_tmap``.
+Only ``strings`` (via ``_smap``) and ``osm_tags`` (via ``_tmap``) need ID
+remapping.  ``places.postcode_id`` and ``places.hn_id`` are string IDs
+remapped via ``_smap``.  ``places.osm_key_id`` and ``places.osm_value_id``
+are osm_tag IDs remapped via ``_tmap``.  ``places.grid_id`` is a
+deterministic integer (no remapping needed).
 
-R-tree centroid-only storage
------------------------------
-``rtree_data`` staging table stores only the centroid ``(id, lat, lon)``.
-During merge the centroid is inserted as a degenerate R-tree bounding box
-``(min_lat=lat, max_lat=lat, min_lon=lon, max_lon=lon)``, which always
-satisfies the R-tree constraint ``min <= max``.  Storing only the centroid
-and ignoring the bbox entirely eliminates the infamous
-``IntegrityError: rtree constraint failed: places_rtree.(min_lat<=max_lat)``
-that can occur when OSM bbox data contains swapped or equal coordinates.
+R-tree grid cell storage
+-------------------------
+When ``grid_size`` > 0, places are grouped into grid cells of that size (in
+degrees) and multiple places may share a single R-tree entry.  The
+``places.grid_id`` column stores the packed cell ID (used as the R-tree PK).
+In no-grid mode (default) ``grid_id = place_id`` and each place has its own
+R-tree centroid point.  The ``rtree_data`` staging table always stores the
+full bounding box ``(id, min_lat, max_lat, min_lon, max_lon)``; in no-grid
+mode min==max (centroid point).
 
 FTS5 contentless table
 -----------------------
@@ -57,7 +57,8 @@ The final database uses ``content=''`` (contentless) FTS5.  Only the trigram
 index is stored — the text content is NOT persisted in FTS5 shadow tables.
 Queries retrieve the matching ``rowid`` (which equals ``place_id``) and join
 ``places``.  Workers still use a plain ``fts_data`` staging table for
-efficient aggregation.
+efficient aggregation.  All FTS text is Unicode-normalised (diacritics
+stripped) so that "elysee" matches "Élysées".
 
 The ``names`` column also includes raw category token strings and all their
 translated labels (from ``osm_tag_translations``), enabling queries like
@@ -102,9 +103,11 @@ from .schema import (
     NAME_KIND_IDS,
     build_lang_ids,
     compress_json,
+    compute_grid_bounds,
     create_database,
     create_indexes,
     create_worker_database,
+    normalize_for_fts,
 )
 
 log = logging.getLogger(__name__)
@@ -146,7 +149,7 @@ _TAG_TRANSLATIONS_URL = (
 )
 
 # ---------------------------------------------------------------------------
-# Default OSM tag filter
+# Default OSM tag filter (block-list)
 # ---------------------------------------------------------------------------
 # Places whose (osm_key, osm_value) matches an entry here are skipped during
 # import.  Use None as osm_value to block all values for that key.
@@ -179,6 +182,30 @@ def _matches_tag_filter(
         return True
     # Key-only match (osm_value=None in filter means "all values").
     if (osm_key, None) in tag_filter:
+        return True
+    return False
+
+
+def _matches_tag_include(
+    osm_key: Optional[str],
+    osm_value: Optional[str],
+    tag_include: Set[Tuple[Optional[str], Optional[str]]],
+) -> bool:
+    """Return True if this (key, value) pair is allowed by the include filter.
+
+    With an *include* (allow-list) filter only places whose tag matches an
+    entry are imported.  ``None`` as osm_value in the filter means "all values
+    for that key".
+
+    If *tag_include* is empty every place is accepted (no filtering).
+    """
+    if not tag_include:
+        return True
+    # Exact (key, value) match.
+    if (osm_key, osm_value) in tag_include:
+        return True
+    # Key-only match (osm_value=None in filter means "all values").
+    if (osm_key, None) in tag_include:
         return True
     return False
 
@@ -285,12 +312,18 @@ def _parse_place_entry(
     lang_set: Set[str],
     poly_filter: Optional[PolyFilter],
     tag_filter: Optional[Set[Tuple[Optional[str], Optional[str]]]] = None,
+    tag_include: Optional[Set[Tuple[Optional[str], Optional[str]]]] = None,
     store_extra: bool = False,
 ) -> Optional[Dict]:
     """Parse one place sub-entry from a photon ``Place`` object.
 
     Returns ``None`` if the entry is invalid, filtered out, or has no valid
     integer place_id (used as the database primary key).
+
+    *tag_filter* is an exclude/block-list: matching (key, value) pairs are
+    skipped.  *tag_include* is an include/allow-list: when non-empty only
+    matching (key, value) pairs are kept.  The two filters are independent;
+    *tag_filter* is applied first.
     """
     place_id = _parse_photon_id(entry.get("place_id"))
     if place_id is None:
@@ -313,6 +346,9 @@ def _parse_place_entry(
     osm_value = _scalar(entry.get("osm_value"))
 
     if tag_filter and _matches_tag_filter(osm_key, osm_value, tag_filter):
+        return None
+
+    if tag_include is not None and not _matches_tag_include(osm_key, osm_value, tag_include):
         return None
 
     names = _extract_names(entry.get("name"), lang_set)
@@ -492,48 +528,6 @@ class _LocalStringCache:
                 self._cache[val] = sid
 
 
-class _LocalCategoryCache:
-    """Cache category name -> local integer id within a worker database."""
-
-    __slots__ = ("_conn", "_cache")
-
-    def __init__(self, conn: sqlite3.Connection) -> None:
-        self._conn = conn
-        self._cache: Dict[str, int] = {}
-
-    def get_id(self, name: str) -> int:
-        cid = self._cache.get(name)
-        if cid is None:
-            self._conn.execute(
-                "INSERT OR IGNORE INTO categories(name) VALUES (?)", (name,)
-            )
-            row = self._conn.execute(
-                "SELECT id FROM categories WHERE name = ?", (name,)
-            ).fetchone()
-            cid = row[0]
-            self._cache[name] = cid
-        return cid
-
-    def intern_batch(self, names: List[str]) -> None:
-        """Intern a list of category names in bulk."""
-        missing = [n for n in names if n not in self._cache]
-        if not missing:
-            return
-        self._conn.executemany(
-            "INSERT OR IGNORE INTO categories(name) VALUES (?)",
-            ((n,) for n in missing),
-        )
-        for i in range(0, len(missing), _SQL_PARAM_CHUNK):
-            chunk = missing[i : i + _SQL_PARAM_CHUNK]
-            placeholders = ",".join("?" * len(chunk))
-            rows = self._conn.execute(
-                f"SELECT name, id FROM categories WHERE name IN ({placeholders})",
-                chunk,
-            ).fetchall()
-            for cat_name, cid in rows:
-                self._cache[cat_name] = cid
-
-
 class _LocalOsmTagCache:
     """Cache osm tag ``ctx`` → local integer id within a worker database.
 
@@ -687,13 +681,19 @@ def _write_places_batch(
     conn: sqlite3.Connection,
     parsed_places: List[Dict],
     strings: _LocalStringCache,
-    cats: _LocalCategoryCache,
     osm_tags: _LocalOsmTagCache,
     photon_to_db: Dict[str, Tuple[int, Optional[str], Optional[str]]],
     lang_ids: Dict[str, int],
     staging: bool = True,
+    grid_size_scaled: int = 0,
 ) -> None:
-    """Bulk-write a list of already-parsed places into the worker database."""
+    """Bulk-write a list of already-parsed places into the worker database.
+
+    *grid_size_scaled* is ``round(grid_size_degrees * LAT_LON_SCALE)``.
+    When 0 (default) each place gets its own R-tree point entry (current
+    behaviour).  When > 0 places are grouped into grid cells: each cell
+    appears only once in the R-tree, reducing table size for dense data.
+    """
     if not parsed_places:
         return
 
@@ -734,9 +734,8 @@ def _write_places_batch(
             ((code,) for code in country_codes),
         )
 
-    # ---- 2. Bulk-intern all strings and categories -------------------------
+    # ---- 2. Bulk-intern all strings and osm tag tokens --------------------
     all_strings: List[str] = []
-    all_cat_names: List[str] = []
     all_tag_pairs: List[Tuple[str, str]] = []  # (token, ctx) for osm_tags
 
     for place, all_addresses in zip(parsed_places, all_addresses_per_place):
@@ -747,7 +746,6 @@ def _write_places_batch(
             val = place.get(fld)
             if val:
                 all_strings.append(val)
-        all_cat_names.extend(place["categories"])
         # osm_key / osm_value go into osm_tags.
         osm_key = place.get("osm_key")
         osm_value = place.get("osm_value")
@@ -760,7 +758,6 @@ def _write_places_batch(
             all_tag_pairs.extend(_parse_category_parts(cat))
 
     strings.intern_batch(list(dict.fromkeys(all_strings)))
-    cats.intern_batch(list(dict.fromkeys(all_cat_names)))
     # Dedup (token, ctx) pairs by ctx (the unique key) before bulk-intern.
     seen_ctxs: Set[str] = set()
     dedup_tag_pairs: List[Tuple[str, str]] = []
@@ -781,6 +778,13 @@ def _write_places_batch(
         postcode_id  = strings._cache.get(place["postcode"])   if place.get("postcode")   else None
         hn_id        = strings._cache.get(place["housenumber"]) if place.get("housenumber") else None
 
+        lat_int = round(place["lat"] * LAT_LON_SCALE)
+        lon_int = round(place["lon"] * LAT_LON_SCALE)
+        if grid_size_scaled > 0:
+            grid_id, _, _, _, _ = compute_grid_bounds(lat_int, lon_int, grid_size_scaled)
+        else:
+            grid_id = place["_place_id"]
+
         place_rows.append((
             place["_place_id"],
             place["osm_id"],
@@ -791,8 +795,9 @@ def _write_places_batch(
             place["country_code"],
             postcode_id,
             hn_id,
-            round(place["lat"] * LAT_LON_SCALE),
-            round(place["lon"] * LAT_LON_SCALE),
+            lat_int,
+            lon_int,
+            grid_id,
             place["extra"],
         ))
     conn.executemany(
@@ -800,8 +805,8 @@ def _write_places_batch(
         INSERT OR IGNORE INTO places (
             id, osm_id, osm_key_id, osm_value_id,
             addr_type_id, importance, country_code, postcode_id, hn_id,
-            lat, lon, extra
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            lat, lon, grid_id, extra
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         place_rows,
     )
@@ -809,7 +814,6 @@ def _write_places_batch(
     # ---- 4. Bulk-insert child rows ----------------------------------------
     name_rows:     List[Tuple] = []
     addr_rows:     List[Tuple] = []
-    cat_rows:      List[Tuple] = []
     osm_tag_rows:  List[Tuple] = []
     fts_rows:      List[Tuple] = []
     rtree_rows:    List[Tuple] = []
@@ -817,6 +821,7 @@ def _write_places_batch(
     seen_pn:  Set[Tuple] = set()
     seen_pa:  Set[Tuple] = set()
     seen_pot: Set[Tuple] = set()
+    seen_rt:  Set[int]   = set()
 
     for place, all_addresses in zip(parsed_places, all_addresses_per_place):
         pid = place["_place_id"]
@@ -847,13 +852,9 @@ def _write_places_batch(
                 seen_pa.add(row)
                 addr_rows.append(row)
 
+        # Add place_osm_tags entries for each token from the category that is
+        # NOT already covered by osm_key_id / osm_value_id in the place row.
         for cat in place["categories"]:
-            cid = cats._cache.get(cat)
-            if cid is None:
-                continue
-            cat_rows.append((pid, cid))
-            # Add place_osm_tags entries for each token that is NOT already
-            # covered by osm_key_id / osm_value_id stored in the place row.
             for token, ctx in _parse_category_parts(cat):
                 tid = osm_tags._cache.get(ctx)
                 if tid is None:
@@ -866,30 +867,45 @@ def _write_places_batch(
                     seen_pot.add(key)
                     osm_tag_rows.append(key)
 
-        # Build FTS names: place names + postcode + housenumber +
+        # Build FTS names: normalised place names + postcode + housenumber +
         # raw category tokens + all their translated labels.
-        fts_name_tokens: Set[str] = {v for v, _l, _k in place["names"]}
+        # normalize_for_fts strips diacritics so "Élysées" matches "elysees".
+        fts_name_tokens: Set[str] = {
+            normalize_for_fts(v) for v, _l, _k in place["names"]
+        }
         if place.get("postcode"):
-            fts_name_tokens.add(place["postcode"])
+            fts_name_tokens.add(normalize_for_fts(place["postcode"]))
         if place.get("housenumber"):
-            fts_name_tokens.add(place["housenumber"])
+            fts_name_tokens.add(normalize_for_fts(place["housenumber"]))
         # Add raw tokens and translations for all category parts.
         for cat in place["categories"]:
             for token, ctx in _parse_category_parts(cat):
-                fts_name_tokens.add(token)
-                fts_name_tokens.update(osm_tags.get_translated_labels(ctx))
+                fts_name_tokens.add(normalize_for_fts(token))
+                fts_name_tokens.update(
+                    normalize_for_fts(lbl)
+                    for lbl in osm_tags.get_translated_labels(ctx)
+                )
         fts_names = " ".join(sorted(fts_name_tokens))
 
-        fts_addr = " ".join(sorted({v for _t, _l, v in all_addresses}))
+        fts_addr = " ".join(sorted(
+            {normalize_for_fts(v) for _t, _l, v in all_addresses}
+        ))
         fts_rows.append((pid, fts_names.strip(), fts_addr.strip()))
 
-        # Centroid only – no bbox.  min == max satisfies the R-tree constraint.
-        # Stored as scaled integers (×LAT_LON_SCALE) for rtree_i32.
-        rtree_rows.append((
-            pid,
-            round(place["lat"] * LAT_LON_SCALE),
-            round(place["lon"] * LAT_LON_SCALE),
-        ))
+        # R-tree grid cell or per-place point (when no grid).
+        lat_int = round(place["lat"] * LAT_LON_SCALE)
+        lon_int = round(place["lon"] * LAT_LON_SCALE)
+        if grid_size_scaled > 0:
+            g_id, g_min_lat, g_max_lat, g_min_lon, g_max_lon = compute_grid_bounds(
+                lat_int, lon_int, grid_size_scaled
+            )
+        else:
+            g_id, g_min_lat, g_max_lat, g_min_lon, g_max_lon = (
+                pid, lat_int, lat_int, lon_int, lon_int
+            )
+        if g_id not in seen_rt:
+            seen_rt.add(g_id)
+            rtree_rows.append((g_id, g_min_lat, g_max_lat, g_min_lon, g_max_lon))
 
     if name_rows:
         conn.executemany(
@@ -902,12 +918,6 @@ def _write_places_batch(
             "INSERT OR IGNORE INTO place_addresses"
             "(place_id, string_id, addr_type_id, lang_id) VALUES (?,?,?,?)",
             addr_rows,
-        )
-    if cat_rows:
-        conn.executemany(
-            "INSERT OR IGNORE INTO place_categories(place_id, category_id)"
-            " VALUES (?,?)",
-            cat_rows,
         )
     if osm_tag_rows:
         conn.executemany(
@@ -929,17 +939,20 @@ def _write_places_batch(
             )
     if rtree_rows:
         if staging:
+            # INSERT OR IGNORE deduplicates grid cells: two places in the same
+            # cell will only insert one rtree_data row.
             conn.executemany(
-                "INSERT OR REPLACE INTO rtree_data(id, lat, lon) VALUES (?,?,?)",
+                "INSERT OR IGNORE INTO rtree_data(id, min_lat, max_lat, min_lon, max_lon)"
+                " VALUES (?,?,?,?,?)",
                 rtree_rows,
             )
         else:
             # rtree_i32: coordinates stored as 32-bit integers (×LAT_LON_SCALE).
-            # Centroid point: min == max for both lat and lon.
+            # INSERT OR IGNORE handles duplicate grid cells from multiple batches.
             conn.executemany(
-                "INSERT INTO places_rtree(id, min_lat, max_lat, min_lon, max_lon)"
+                "INSERT OR IGNORE INTO places_rtree(id, min_lat, max_lat, min_lon, max_lon)"
                 " VALUES (?,?,?,?,?)",
-                [(r[0], r[1], r[1], r[2], r[2]) for r in rtree_rows],
+                rtree_rows,
             )
 
 
@@ -955,7 +968,9 @@ def _worker_main(
     worker_id: int,
     translations: Optional[Dict[str, Dict[str, str]]] = None,
     tag_filter: Optional[Set[Tuple[Optional[str], Optional[str]]]] = None,
+    tag_include: Optional[Set[Tuple[Optional[str], Optional[str]]]] = None,
     store_extra: bool = False,
+    grid_size_scaled: int = 0,
 ) -> None:
     """Worker process: drain *work_queue* and write parsed results to *db_path*.
 
@@ -976,7 +991,6 @@ def _worker_main(
 
     conn = create_worker_database(db_path, languages)
     strings = _LocalStringCache(conn)
-    cats = _LocalCategoryCache(conn)
     osm_tag_cache = _LocalOsmTagCache(conn, translations, lang_ids, strings)
     photon_to_db: Dict[str, Tuple[int, Optional[str], Optional[str]]] = {}
     local_counter = 0
@@ -1022,7 +1036,8 @@ def _worker_main(
                         continue
                     parsed = _parse_place_entry(
                         entry, lang_set, poly_filter,
-                        tag_filter=tag_filter, store_extra=store_extra,
+                        tag_filter=tag_filter, tag_include=tag_include,
+                        store_extra=store_extra,
                     )
                     if parsed is None:
                         continue
@@ -1035,14 +1050,16 @@ def _worker_main(
         if parsed_places:
             try:
                 _write_places_batch(
-                    conn, parsed_places, strings, cats, osm_tag_cache, photon_to_db, lang_ids
+                    conn, parsed_places, strings, osm_tag_cache, photon_to_db,
+                    lang_ids, grid_size_scaled=grid_size_scaled,
                 )
             except sqlite3.Error as exc:
                 log.warning("Worker %d batch write failed: %s", worker_id, exc)
                 for place in parsed_places:
                     try:
                         _write_places_batch(
-                            conn, [place], strings, cats, osm_tag_cache, photon_to_db, lang_ids
+                            conn, [place], strings, osm_tag_cache, photon_to_db,
+                            lang_ids, grid_size_scaled=grid_size_scaled,
                         )
                     except sqlite3.Error as exc2:
                         log.debug(
@@ -1071,7 +1088,7 @@ def _merge_worker_db(
 
     Uses ATTACH DATABASE and SQL-driven temp mapping tables so that:
 
-    * ``strings``, ``categories``, and ``osm_tags`` are globally deduplicated.
+    * ``strings`` and ``osm_tags`` are globally deduplicated.
     * ``countries`` are inserted by TEXT primary key (code); ``country_names``
       are upserted using remapped string IDs.
     * ``places`` are inserted with their original integer ID (= photon place_id),
@@ -1079,7 +1096,8 @@ def _merge_worker_db(
       Duplicate photon_ids (same place in multiple workers) are silently skipped
       via ``INSERT OR IGNORE``.  Dependent rows (names, addresses, etc.) for a
       skipped place are also skipped via ``WHERE EXISTS`` guards.
-    * R-tree entries are inserted as integer centroid points (rtree_i32).
+    * R-tree entries use grid_id (deterministic, no remap needed); duplicates
+      are suppressed via ``INSERT OR IGNORE``.
 
     Returns the number of places in the worker DB (some may be skipped if already
     present from a previous worker).
@@ -1111,27 +1129,7 @@ def _merge_worker_db(
             "CREATE INDEX IF NOT EXISTS _idx_smap_wid ON _smap(wid)"
         )
 
-        # 3. Categories - same pattern.
-        final_conn.execute(
-            "INSERT OR IGNORE INTO categories(name) SELECT name FROM w.categories"
-        )
-        final_conn.execute(
-            "CREATE TEMP TABLE IF NOT EXISTS _cmap(wid INTEGER, fid INTEGER)"
-        )
-        final_conn.execute("DELETE FROM _cmap")
-        final_conn.execute(
-            """
-            INSERT INTO _cmap(wid, fid)
-            SELECT wc.id, mc.id
-            FROM w.categories wc
-            JOIN main.categories mc ON mc.name = wc.name
-            """
-        )
-        final_conn.execute(
-            "CREATE INDEX IF NOT EXISTS _idx_cmap_wid ON _cmap(wid)"
-        )
-
-        # 4. OSM tags - deduplicate by ctx (UNIQUE), build _tmap.
+        # 3. OSM tags - deduplicate by ctx (UNIQUE), build _tmap.
         final_conn.execute(
             "INSERT OR IGNORE INTO osm_tags(token, ctx) SELECT token, ctx FROM w.osm_tags"
         )
@@ -1151,7 +1149,7 @@ def _merge_worker_db(
             "CREATE INDEX IF NOT EXISTS _idx_tmap_wid ON _tmap(wid)"
         )
 
-        # 5. OSM tag names (translations) - remap tag_id via _tmap, string_id via _smap.
+        # 4. OSM tag names (translations) - remap tag_id via _tmap, string_id via _smap.
         final_conn.execute(
             """
             INSERT OR IGNORE INTO osm_tag_names(tag_id, string_id, lang_id)
@@ -1162,12 +1160,12 @@ def _merge_worker_db(
             """
         )
 
-        # 6. Countries - INSERT OR IGNORE by TEXT primary key (no remap needed).
+        # 5. Countries - INSERT OR IGNORE by TEXT primary key (no remap needed).
         final_conn.execute(
             "INSERT OR IGNORE INTO countries(code) SELECT code FROM w.countries"
         )
 
-        # 7. Metadata - upsert.
+        # 6. Metadata - upsert.
         final_conn.execute(
             """
             INSERT OR REPLACE INTO metadata(key, value)
@@ -1175,7 +1173,7 @@ def _merge_worker_db(
             """
         )
 
-        # 8. Ensure all country_codes referenced by the worker's places exist.
+        # 7. Ensure all country_codes referenced by the worker's places exist.
         final_conn.execute(
             """
             INSERT OR IGNORE INTO countries(code)
@@ -1185,7 +1183,7 @@ def _merge_worker_db(
             """
         )
 
-        # 9. Country names - remap string_id via _smap; lang_id is pre-seeded (no remap).
+        # 8. Country names - remap string_id via _smap; lang_id is pre-seeded (no remap).
         #    OR REPLACE to overwrite placeholder-only rows with real names.
         final_conn.execute(
             """
@@ -1202,17 +1200,18 @@ def _merge_worker_db(
         worker_place_count: int = worker_count_row[0]
 
         if worker_place_count > 0:
-            # 10. Places - use the worker's original id (= photon place_id) as
-            #     the final id.  INSERT OR IGNORE handles duplicate photon_ids
-            #     from multiple workers gracefully.
-            #     osm_key_id/osm_value_id remapped via _tmap (osm_tags IDs).
-            #     postcode_id and hn_id remapped via _smap (string IDs).
-            #     addr_type_id is pre-seeded (same IDs everywhere) – no remap.
+            # 9. Places - use the worker's original id (= photon place_id) as
+            #    the final id.  INSERT OR IGNORE handles duplicate photon_ids
+            #    from multiple workers gracefully.
+            #    osm_key_id/osm_value_id remapped via _tmap (osm_tags IDs).
+            #    postcode_id and hn_id remapped via _smap (string IDs).
+            #    addr_type_id is pre-seeded (same IDs everywhere) – no remap.
+            #    grid_id is a deterministic packed integer – no remap needed.
             final_conn.execute(
                 """
                 INSERT OR IGNORE INTO places(
                     id, osm_id, osm_key_id, osm_value_id, addr_type_id,
-                    importance, country_code, postcode_id, hn_id, lat, lon, extra
+                    importance, country_code, postcode_id, hn_id, lat, lon, grid_id, extra
                 )
                 SELECT
                     wp.id,
@@ -1226,6 +1225,7 @@ def _merge_worker_db(
                     sh.fid,
                     wp.lat,
                     wp.lon,
+                    wp.grid_id,
                     wp.extra
                 FROM w.places wp
                 LEFT JOIN _tmap tk ON tk.wid = wp.osm_key_id
@@ -1235,7 +1235,7 @@ def _merge_worker_db(
                 """
             )
 
-            # 11. place_names - remap string_id via _smap.
+            # 10. place_names - remap string_id via _smap.
             #     place_id is the photon id (stable across workers).
             #     lang_id and kind_id are pre-seeded (no remap).
             #     WHERE EXISTS guards against places skipped by INSERT OR IGNORE.
@@ -1249,7 +1249,7 @@ def _merge_worker_db(
                 """
             )
 
-            # 12. place_addresses - remap string_id via _smap.
+            # 11. place_addresses - remap string_id via _smap.
             #     addr_type_id and lang_id are pre-seeded (no remap).
             final_conn.execute(
                 """
@@ -1261,18 +1261,7 @@ def _merge_worker_db(
                 """
             )
 
-            # 13. place_categories - remap category_id via _cmap.
-            final_conn.execute(
-                """
-                INSERT OR IGNORE INTO place_categories(place_id, category_id)
-                SELECT pc.place_id, cm.fid
-                FROM w.place_categories pc
-                JOIN _cmap cm ON cm.wid = pc.category_id
-                WHERE EXISTS (SELECT 1 FROM main.places WHERE id = pc.place_id)
-                """
-            )
-
-            # 14. place_osm_tags - remap tag_id via _tmap.
+            # 12. place_osm_tags - remap tag_id via _tmap.
             final_conn.execute(
                 """
                 INSERT OR IGNORE INTO place_osm_tags(place_id, tag_id)
@@ -1283,7 +1272,7 @@ def _merge_worker_db(
                 """
             )
 
-            # 15. FTS5 (contentless) - rowid = place_id.
+            # 13. FTS5 (contentless) - rowid = place_id.
             final_conn.execute(
                 """
                 INSERT INTO places_fts(rowid, names, address)
@@ -1293,14 +1282,13 @@ def _merge_worker_db(
                 """
             )
 
-            # 16. R-tree (rtree_i32) - centroid point: min == max for lat and lon.
-            #     Coordinates are already scaled integers (×LAT_LON_SCALE).
+            # 14. R-tree – id is grid_id (deterministic, no remap needed).
+            #     INSERT OR IGNORE safely deduplicates shared grid cells.
             final_conn.execute(
                 """
-                INSERT INTO places_rtree(id, min_lat, max_lat, min_lon, max_lon)
-                SELECT rd.id, rd.lat, rd.lat, rd.lon, rd.lon
+                INSERT OR IGNORE INTO places_rtree(id, min_lat, max_lat, min_lon, max_lon)
+                SELECT rd.id, rd.min_lat, rd.max_lat, rd.min_lon, rd.max_lon
                 FROM w.rtree_data rd
-                WHERE EXISTS (SELECT 1 FROM main.places WHERE id = rd.id)
                 """
             )
 
@@ -1326,8 +1314,8 @@ def _merge_worker_db(
 def _cleanup_merged_db(conn: sqlite3.Connection) -> None:
     """Remove orphaned rows and compact the database after all workers are merged.
 
-    Orphaned strings/categories can accumulate when two workers contain the
-    same photon_id (duplicate places) — the second worker's strings are merged
+    Orphaned strings can accumulate when two workers contain the same
+    photon_id (duplicate places) — the second worker's strings are merged
     but its place rows (and dependent rows) are skipped.  This step removes
     the resulting orphans and runs VACUUM to compact the file.
     """
@@ -1345,14 +1333,6 @@ def _cleanup_merged_db(conn: sqlite3.Connection) -> None:
               SELECT postcode_id FROM places WHERE postcode_id IS NOT NULL)
           AND id NOT IN (
               SELECT hn_id FROM places WHERE hn_id IS NOT NULL)
-        """
-    )
-
-    # Delete categories not assigned to any place.
-    conn.execute(
-        """
-        DELETE FROM categories
-        WHERE id NOT IN (SELECT category_id FROM place_categories)
         """
     )
 
@@ -1413,7 +1393,9 @@ def _import_single_thread(
     show_progress: bool,
     translations: Optional[Dict[str, Dict[str, str]]] = None,
     tag_filter: Optional[Set[Tuple[Optional[str], Optional[str]]]] = None,
+    tag_include: Optional[Set[Tuple[Optional[str], Optional[str]]]] = None,
     store_extra: bool = False,
+    grid_size_scaled: int = 0,
 ) -> None:
     """Import directly into the final database on a single thread."""
     poly_filter: Optional[PolyFilter] = None
@@ -1441,10 +1423,14 @@ def _import_single_thread(
         "INSERT OR REPLACE INTO metadata(key, value) VALUES (?,?)",
         ("languages", json.dumps(languages)),
     )
+    if grid_size_scaled:
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata(key, value) VALUES (?,?)",
+            ("grid_size_scaled", str(grid_size_scaled)),
+        )
     conn.execute("COMMIT")
 
     strings = _LocalStringCache(conn)
-    cats = _LocalCategoryCache(conn)
     osm_tag_cache = _LocalOsmTagCache(conn, translations, lang_ids, strings)
     photon_to_db: Dict[str, Tuple[int, Optional[str], Optional[str]]] = {}
     total_places = 0
@@ -1492,7 +1478,8 @@ def _import_single_thread(
                             continue
                         parsed = _parse_place_entry(
                             entry, lang_set, poly_filter,
-                            tag_filter=tag_filter, store_extra=store_extra,
+                            tag_filter=tag_filter, tag_include=tag_include,
+                            store_extra=store_extra,
                         )
                         if parsed is None:
                             continue
@@ -1505,16 +1492,16 @@ def _import_single_thread(
             if parsed_places:
                 try:
                     _write_places_batch(
-                        conn, parsed_places, strings, cats, osm_tag_cache, photon_to_db,
-                        lang_ids, staging=False,
+                        conn, parsed_places, strings, osm_tag_cache, photon_to_db,
+                        lang_ids, staging=False, grid_size_scaled=grid_size_scaled,
                     )
                 except sqlite3.Error as exc:
                     log.warning("Batch write failed: %s", exc)
                     for place in parsed_places:
                         try:
                             _write_places_batch(
-                                conn, [place], strings, cats, osm_tag_cache, photon_to_db,
-                                lang_ids, staging=False,
+                                conn, [place], strings, osm_tag_cache, photon_to_db,
+                                lang_ids, staging=False, grid_size_scaled=grid_size_scaled,
                             )
                         except sqlite3.Error as exc2:
                             log.debug(
@@ -1558,7 +1545,7 @@ def _import_single_thread(
 # ---------------------------------------------------------------------------
 
 def load_tag_filter(path: str) -> Set[Tuple[Optional[str], Optional[str]]]:
-    """Load an OSM tag filter from a JSON file.
+    """Load an OSM tag block-list filter from a JSON file.
 
     The file must contain a JSON array of objects with ``osm_key`` and an
     optional ``osm_value`` field.  If ``osm_value`` is absent or null the
@@ -1585,6 +1572,34 @@ def load_tag_filter(path: str) -> Set[Tuple[Optional[str], Optional[str]]]:
     return result
 
 
+def load_tag_include_filter(path: str) -> Set[Tuple[Optional[str], Optional[str]]]:
+    """Load an OSM tag allow-list filter from a JSON file.
+
+    Only places whose (osm_key, osm_value) matches at least one entry in
+    the file will be imported.  Use ``null`` / absent ``osm_value`` to
+    include all values for a key.
+
+    Example (include only natural peaks and all tourism features)::
+
+        [
+            {"osm_key": "natural", "osm_value": "peak"},
+            {"osm_key": "tourism"}
+        ]
+    """
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+    if not isinstance(data, list):
+        raise ValueError(f"Tag include filter file must be a JSON array: {path}")
+    result: Set[Tuple[Optional[str], Optional[str]]] = set()
+    for item in data:
+        if not isinstance(item, dict) or "osm_key" not in item:
+            continue
+        key = item["osm_key"] or None
+        value = item.get("osm_value") or None
+        result.add((key, value))
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Public import entry point
 # ---------------------------------------------------------------------------
@@ -1600,7 +1615,9 @@ def import_database(
     single_thread: bool = False,
     fetch_translations: bool = True,
     tag_filter: Optional[Set[Tuple[Optional[str], Optional[str]]]] = None,
+    tag_include: Optional[Set[Tuple[Optional[str], Optional[str]]]] = None,
     store_extra: bool = False,
+    grid_size: float = 0.0,
 ) -> None:
     """Import a Photon JSONL(.zst) dump into *output_path*.
 
@@ -1612,14 +1629,24 @@ def import_database(
         and stored in the database.  Set to ``False`` to skip translation
         download (e.g. in offline or testing environments).
     tag_filter:
-        Set of ``(osm_key, osm_value)`` pairs to skip during import.  Use
-        ``None`` as osm_value to block all values for a key.  Defaults to
-        ``_DEFAULT_TAG_FILTER`` when not provided.  Pass an empty set to
-        disable filtering entirely.
+        Set of ``(osm_key, osm_value)`` pairs to *skip* during import (block-
+        list).  Use ``None`` as osm_value to block all values for a key.
+        Defaults to ``_DEFAULT_TAG_FILTER`` when not provided.  Pass an empty
+        set to disable filtering entirely.
+    tag_include:
+        Set of ``(osm_key, osm_value)`` pairs to *keep* during import (allow-
+        list).  When non-empty only places whose tag matches an entry are
+        imported.  Use ``None`` as osm_value to include all values for a key.
+        Applied *after* tag_filter.  Defaults to ``None`` (no allowlist).
     store_extra:
         When ``True``, the ``extra`` JSON blob from each photon entry is
         compressed and stored in ``places.extra``.  Defaults to ``False``
         to save disk space.
+    grid_size:
+        Grid cell size in degrees for R-tree compression.  When > 0 places
+        are grouped into cells of this size and each cell appears only once
+        in the R-tree, reducing its size for dense datasets.  When 0
+        (default) each place has its own R-tree entry (current behaviour).
     """
     if not languages:
         raise ValueError("At least one language must be specified.")
@@ -1628,6 +1655,9 @@ def import_database(
     effective_filter: Set[Tuple[Optional[str], Optional[str]]] = (
         _DEFAULT_TAG_FILTER if tag_filter is None else tag_filter
     )
+
+    # Scale grid_size to integer coordinates.
+    grid_size_scaled = round(grid_size * LAT_LON_SCALE) if grid_size > 0 else 0
 
     # Download tag translations once before spawning workers.
     translations: Dict[str, Dict[str, str]] = {}
@@ -1650,7 +1680,9 @@ def import_database(
             show_progress=show_progress,
             translations=translations,
             tag_filter=effective_filter,
+            tag_include=tag_include,
             store_extra=store_extra,
+            grid_size_scaled=grid_size_scaled,
         )
         return
 
@@ -1693,7 +1725,9 @@ def import_database(
                 worker_id=i,
                 translations=translations,
                 tag_filter=effective_filter,
+                tag_include=tag_include,
                 store_extra=store_extra,
+                grid_size_scaled=grid_size_scaled,
             ),
             daemon=True,
         )
@@ -1744,6 +1778,11 @@ def import_database(
         "INSERT OR REPLACE INTO metadata(key, value) VALUES (?,?)",
         ("languages", json.dumps(languages)),
     )
+    if grid_size_scaled:
+        final_conn.execute(
+            "INSERT OR REPLACE INTO metadata(key, value) VALUES (?,?)",
+            ("grid_size_scaled", str(grid_size_scaled)),
+        )
     final_conn.execute("COMMIT")
 
     total_places = 0

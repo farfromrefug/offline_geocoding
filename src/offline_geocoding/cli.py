@@ -5,21 +5,27 @@ Commands
 import   – Build a geocoding database from a Photon JSONL(.zst) dump.
 search   – Forward-geocoding / full-text place search.
 reverse  – Reverse geocoding (nearest place to a coordinate).
-stats    – Show database statistics.
+stats    – Show database statistics (row counts + per-table disk usage).
 
 Examples
 --------
 # Build a database for English + French, filtered to a .poly region:
-    offline-geocoding import \
-        --input  /data/photon-dump.jsonl.zst \
-        --output /data/geocoding.db \
-        --languages en,fr \
-        --poly    /data/europe.poly \
+    offline-geocoding import \\
+        --input  /data/photon-dump.jsonl.zst \\
+        --output /data/geocoding.db \\
+        --languages en,fr \\
+        --poly    /data/europe.poly \\
         --workers 8
+
+# Import only natural peaks and all tourism features:
+    offline-geocoding import ... --tag-include /data/include.json
+
+# Compress R-tree to 0.1° grid cells:
+    offline-geocoding import ... --grid-size 0.1
 
 # Search:
     offline-geocoding search --db /data/geocoding.db "Eiffel Tower"
-    offline-geocoding search --db /data/geocoding.db "Paris" \
+    offline-geocoding search --db /data/geocoding.db "Paris" \\
         --bbox 2.0,48.5,3.0,49.2 --limit 5
 
 # Reverse geocoding:
@@ -183,10 +189,38 @@ def main() -> None:
     default=None,
     type=click.Path(exists=True, dir_okay=False, readable=True),
     help=(
-        "Path to a JSON file specifying OSM tag combinations to skip during "
-        "import.  File must be a JSON array of objects with 'osm_key' and "
-        "optional 'osm_value' fields.  When not specified a built-in default "
-        "filter is applied.  Pass an empty array file to disable filtering."
+        "Path to a JSON file specifying OSM tag combinations to *skip* during "
+        "import (block-list).  File must be a JSON array of objects with "
+        "'osm_key' and optional 'osm_value' fields.  When not specified a "
+        "built-in default filter is applied.  Pass an empty array file to "
+        "disable filtering."
+    ),
+)
+@click.option(
+    "--tag-include",
+    "tag_include_path",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False, readable=True),
+    help=(
+        "Path to a JSON file specifying OSM tag combinations to *keep* during "
+        "import (allow-list).  Only places matching at least one entry are "
+        "imported.  Use null/absent 'osm_value' to include all values for a "
+        "key.  Applied after --tag-filter.  Example entry to include all "
+        "natural features: {\"osm_key\": \"natural\"}."
+    ),
+)
+@click.option(
+    "--grid-size",
+    "grid_size",
+    default=0.0,
+    show_default=True,
+    type=float,
+    help=(
+        "R-tree grid cell size in degrees.  When > 0, places within the same "
+        "grid cell share a single R-tree entry, reducing R-tree table size for "
+        "dense datasets.  For example, 0.1 creates ~11 km grid cells.  "
+        "Reverse queries remain correct but may return a few extra candidates "
+        "near cell borders.  Default 0 = one R-tree entry per place."
     ),
 )
 def cmd_import(
@@ -200,6 +234,8 @@ def cmd_import(
     single_thread: bool,
     store_extra: bool,
     tag_filter_path: Optional[str],
+    tag_include_path: Optional[str],
+    grid_size: float,
 ) -> None:
     """Import a Photon JSONL(.zst) dump into a geocoding SQLite database."""
     _setup_logging(verbose)
@@ -211,15 +247,23 @@ def cmd_import(
     if poly_file:
         click.echo(f"  poly filter: {poly_file}")
 
-    from .importer import import_database, load_tag_filter, _DEFAULT_TAG_FILTER
+    from .importer import import_database, load_tag_filter, load_tag_include_filter, _DEFAULT_TAG_FILTER
 
     tag_filter = None
     if tag_filter_path is not None:
         tag_filter = load_tag_filter(tag_filter_path)
-        click.echo(f"  tag filter: {tag_filter_path} ({len(tag_filter)} rules)")
+        click.echo(f"  tag filter (block): {tag_filter_path} ({len(tag_filter)} rules)")
     else:
         tag_filter = _DEFAULT_TAG_FILTER
-        click.echo(f"  tag filter: built-in default ({len(tag_filter)} rules)")
+        click.echo(f"  tag filter (block): built-in default ({len(tag_filter)} rules)")
+
+    tag_include = None
+    if tag_include_path is not None:
+        tag_include = load_tag_include_filter(tag_include_path)
+        click.echo(f"  tag include (allow): {tag_include_path} ({len(tag_include)} rules)")
+
+    if grid_size > 0:
+        click.echo(f"  R-tree grid size: {grid_size}°")
 
     import_database(
         input_path=input_path,
@@ -231,7 +275,9 @@ def cmd_import(
         show_progress=True,
         single_thread=single_thread,
         tag_filter=tag_filter,
+        tag_include=tag_include,
         store_extra=store_extra,
+        grid_size=grid_size,
     )
     click.echo("Done.")
 
@@ -409,20 +455,37 @@ def cmd_reverse(
     is_flag=True,
     help="Output as JSON.",
 )
-def cmd_stats(db_path: str, output_json: bool) -> None:
-    """Show row-count statistics for a geocoding database."""
-    from .query import stats as do_stats, get_languages
+@click.option(
+    "--sizes",
+    "show_sizes",
+    is_flag=True,
+    default=False,
+    help="Also show per-table disk usage (requires dbstat virtual table).",
+)
+def cmd_stats(db_path: str, output_json: bool, show_sizes: bool) -> None:
+    """Show row-count (and optionally disk-usage) statistics for a geocoding database."""
+    from .query import stats as do_stats, get_languages, table_sizes as do_table_sizes
 
     counts = do_stats(db_path)
     langs = get_languages(db_path)
+    sizes = do_table_sizes(db_path) if show_sizes else []
 
     if output_json:
-        click.echo(
-            json.dumps({"languages": langs, "counts": counts}, indent=2)
-        )
+        out: dict = {"languages": langs, "counts": counts}
+        if sizes:
+            out["table_sizes"] = sizes
+        click.echo(json.dumps(out, indent=2))
     else:
         click.echo(f"Database: {db_path}")
         click.echo(f"Languages: {', '.join(langs) if langs else '(unknown)'}")
         click.echo("Row counts:")
         for table, count in counts.items():
             click.echo(f"  {table:<22} {count:>12,}")
+        if sizes:
+            click.echo("Disk usage (by table/index):")
+            for entry in sizes:
+                size_kb = entry["bytes"] / 1024
+                click.echo(
+                    f"  {entry['table']:<30} {entry['pages']:>8} pages  "
+                    f"{size_kb:>10.1f} KB"
+                )

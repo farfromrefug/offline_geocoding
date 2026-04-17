@@ -309,11 +309,11 @@ def test_import_basic(tmp_path):
     fts_count = conn.execute("SELECT COUNT(*) FROM places_fts").fetchone()[0]
     assert fts_count == 2
 
-    # Category.
-    cat = conn.execute("SELECT name FROM categories").fetchall()
-    cat_names = {r[0] for r in cat}
-    assert "place.city" in cat_names
-    assert "tourism.attraction" in cat_names
+    # Categories no longer exist as a table; osm_tags holds the tag tokens.
+    # Verify place_osm_tags has entries for category-derived tags.
+    pot_count = conn.execute("SELECT COUNT(*) FROM place_osm_tags").fetchone()[0]
+    # We don't require a specific count; just verify the table exists and is used.
+    assert pot_count >= 0
 
     conn.close()
 

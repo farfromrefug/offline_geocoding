@@ -133,7 +133,8 @@ def test_stats(db_path):
     counts = stats(db_path)
     assert counts["places"] == 3
     assert counts["strings"] > 0
-    assert counts["categories"] >= 2
+    # categories table is removed; check osm_tags instead
+    assert counts["osm_tags"] >= 2
 
 
 def test_get_languages(db_path):

@@ -47,6 +47,7 @@ from .schema import (
     LAT_LON_SCALE,
     NAME_KIND_IDS,
     apply_pragmas,
+    normalize_for_fts,
 )
 
 # ---------------------------------------------------------------------------
@@ -196,17 +197,6 @@ def _format_place(
         names_by_lang_kind[(r["lang"], kind_str)] = r["value"]
         all_name_values.append(r["value"])
 
-    # Resolve display name.
-    display_name: Optional[str] = None
-    for lang in (languages or []):
-        display_name = names_by_lang_kind.get((lang, "name"))
-        if display_name:
-            break
-    if display_name is None:
-        display_name = names_by_lang_kind.get(("default", "name"))
-    if display_name is None and all_name_values:
-        display_name = all_name_values[0]
-
     # Address components.
     addr_rows = conn.execute(
         """
@@ -226,30 +216,91 @@ def _format_place(
         key = at_str if ar["lang"] == "default" else f"{at_str}:{ar['lang']}"
         address[key] = ar["value"]
 
-    # Categories.
-    cat_rows = conn.execute(
+    # Resolve display name.
+    display_name: Optional[str] = None
+    for lang in (languages or []):
+        display_name = names_by_lang_kind.get((lang, "name"))
+        if display_name:
+            break
+    if display_name is None:
+        display_name = names_by_lang_kind.get(("default", "name"))
+    if display_name is None and all_name_values:
+        display_name = all_name_values[0]
+
+    # For unnamed places build a human-readable display name from address
+    # components: "housenumber street, city, country".
+    if display_name is None:
+        osm_key_tmp   = _resolve_osm_tag_token(conn, row["osm_key_id"])
+        osm_value_tmp = _resolve_osm_tag_token(conn, row["osm_value_id"])
+        postcode_tmp  = _resolve_string(conn, row["postcode_id"])
+        hn_tmp        = _resolve_string(conn, row["hn_id"])
+
+        # Pick address values for the preferred language.
+        def _addr(key: str) -> Optional[str]:
+            for lang in (languages or ["default"]):
+                k = key if lang == "default" else f"{key}:{lang}"
+                v = address.get(k)
+                if v:
+                    return v
+            return address.get(key)
+
+        addr_parts: List[str] = []
+        if hn_tmp and _addr("street"):
+            addr_parts.append(f"{hn_tmp} {_addr('street')}")
+        elif _addr("street"):
+            addr_parts.append(_addr("street"))  # type: ignore[arg-type]
+        elif hn_tmp:
+            addr_parts.append(hn_tmp)
+        for key in ("city", "district", "locality", "state", "country"):
+            v = _addr(key)
+            if v:
+                addr_parts.append(v)
+        if postcode_tmp:
+            addr_parts.append(postcode_tmp)
+        if addr_parts:
+            display_name = ", ".join(addr_parts)
+        elif osm_key_tmp:
+            # Last resort: use osm_key[=value] as a generic label.
+            display_name = (
+                f"{osm_key_tmp}={osm_value_tmp}"
+                if osm_value_tmp else osm_key_tmp
+            )
+
+    # Categories: derive from osm_key/osm_value + extra place_osm_tags.
+    # This replaces the old categories/place_categories tables.
+    osm_key     = _resolve_osm_tag_token(conn, row["osm_key_id"])
+    osm_value   = _resolve_osm_tag_token(conn, row["osm_value_id"])
+    postcode    = _resolve_string(conn, row["postcode_id"])
+    housenumber = _resolve_string(conn, row["hn_id"])
+    address_type = _ADDR_TYPE_BY_ID.get(row["addr_type_id"]) if row["addr_type_id"] else None
+
+    category_list: List[str] = []
+    if osm_key:
+        category_list.append(osm_key)
+    if osm_value:
+        category_list.append(osm_value)
+    # Extra tokens stored in place_osm_tags (not already in key/value).
+    extra_tag_rows = conn.execute(
         """
-        SELECT c.name
-        FROM place_categories pc
-        JOIN categories c ON c.id = pc.category_id
-        WHERE pc.place_id = ?
+        SELECT ot.token
+        FROM place_osm_tags pot
+        JOIN osm_tags ot ON ot.id = pot.tag_id
+        WHERE pot.place_id = ?
         """,
         (place_id,),
     ).fetchall()
-    category_list = [r["name"] for r in cat_rows]
+    seen_cats = set(category_list)
+    for tr in extra_tag_rows:
+        tok = tr["token"]
+        if tok not in seen_cats:
+            seen_cats.add(tok)
+            category_list.append(tok)
 
     # Country name from country_names table.
     country_code: Optional[str] = row["country_code"]
     country_name = _resolve_country_name(
         conn, country_code, languages or [], country_cache
     )
-
-    # Resolve string-ID columns.
-    osm_key     = _resolve_osm_tag_token(conn, row["osm_key_id"])
-    osm_value   = _resolve_osm_tag_token(conn, row["osm_value_id"])
-    postcode    = _resolve_string(conn, row["postcode_id"])
-    housenumber = _resolve_string(conn, row["hn_id"])
-    address_type = _ADDR_TYPE_BY_ID.get(row["addr_type_id"]) if row["addr_type_id"] else None
 
     # Extra tags.
     extra: Optional[Dict] = None
@@ -304,6 +355,8 @@ def search(
         Path to the SQLite database or an open connection.
     query:
         Search string.  Trigram FTS supports substring matching.
+        Diacritics are stripped before matching so that, for example,
+        ``"elysee"`` matches ``"Élysées"``.
     languages:
         Preferred language order for display names.
     bbox:
@@ -402,9 +455,10 @@ def reverse(
     Uses the R-tree index for a fast bounding-box pre-filter, then ranks
     candidates by Euclidean distance (in degrees).
 
-    The R-tree stores centroid points (min == max for lat/lon), so the query
-    ``min_lat <= max_lat_query AND max_lat >= min_lat_query`` correctly finds
-    all centroids within the radius box.
+    The R-tree stores per-place centroid points (when no grid) or grid-cell
+    bounding boxes (when grid mode is enabled).  In both cases the join uses
+    ``places.grid_id = rt.id``; in no-grid mode ``places.grid_id = places.id``
+    so the result is identical to a direct primary-key join.
 
     Parameters
     ----------
@@ -428,11 +482,14 @@ def reverse(
         min_lon_i = round((lon - radius_deg) * LAT_LON_SCALE)
         max_lon_i = round((lon + radius_deg) * LAT_LON_SCALE)
 
+        # Join via grid_id: works for both no-grid (grid_id = place_id) and
+        # grid mode (grid_id = cell_id, multiple places per cell).
+        # The R-tree WHERE clause finds all cells overlapping the search box.
         sql = """
             SELECT p.*,
                    ((p.lat - ?) * (p.lat - ?) + (p.lon - ?) * (p.lon - ?)) AS dist_sq
             FROM places_rtree rt
-            JOIN places p ON p.id = rt.id
+            JOIN places p ON p.grid_id = rt.id
             WHERE rt.min_lat <= ? AND rt.max_lat >= ?
               AND rt.min_lon <= ? AND rt.max_lon >= ?
             ORDER BY dist_sq
@@ -464,8 +521,13 @@ def reverse(
 # ---------------------------------------------------------------------------
 
 def _escape_fts(query: str) -> str:
-    """Wrap *query* in double-quotes to prevent FTS5 syntax errors."""
-    clean = query.replace('"', ' ').strip()
+    """Wrap *query* in double-quotes to prevent FTS5 syntax errors.
+
+    Diacritical marks are stripped via Unicode NFD decomposition before
+    building the query, so that ``"elysee"`` matches ``"Élysées"`` in the
+    trigram index (where names are also stored without diacritics).
+    """
+    clean = normalize_for_fts(query).replace('"', ' ').strip()
     if not clean:
         return '""'
     return f'"{clean}"'
@@ -490,17 +552,52 @@ def stats(db: _DbArg) -> Dict[str, int]:
             for table in (
                 "places",
                 "strings",
-                "categories",
                 "osm_tags",
                 "osm_tag_names",
                 "countries",
                 "country_names",
                 "place_names",
                 "place_addresses",
-                "place_categories",
                 "place_osm_tags",
             )
         }
+    finally:
+        if should_close:
+            conn.close()
+
+
+def table_sizes(db: _DbArg) -> List[Dict[str, Any]]:
+    """Return per-table disk usage statistics using the ``dbstat`` virtual table.
+
+    Each entry has the keys:
+
+    * ``table``  – table/index name
+    * ``pages``  – number of B-tree pages used
+    * ``bytes``  – estimated size in bytes (``pages × page_size``)
+
+    Results are ordered by size descending.  Requires SQLite to be compiled
+    with ``SQLITE_ENABLE_DBSTAT_VTAB`` (the default for most distributions).
+    """
+    conn, should_close = _conn(db)
+    try:
+        page_size: int = conn.execute("PRAGMA page_size").fetchone()[0]
+        rows = conn.execute(
+            """
+            SELECT name AS tbl, SUM(pageno IS NOT NULL) AS pages
+            FROM dbstat
+            WHERE aggregate = TRUE
+            GROUP BY name
+            ORDER BY pages DESC
+            """
+        ).fetchall()
+        return [
+            {
+                "table": r["tbl"],
+                "pages": r["pages"],
+                "bytes": r["pages"] * page_size,
+            }
+            for r in rows
+        ]
     finally:
         if should_close:
             conn.close()

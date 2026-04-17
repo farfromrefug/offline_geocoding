@@ -71,9 +71,37 @@ import gzip
 import json
 import logging
 import sqlite3
+import unicodedata
 from typing import Any, Dict, List, Sequence
 
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# FTS normalisation
+# ---------------------------------------------------------------------------
+
+def normalize_for_fts(text: str) -> str:
+    """Strip diacritical marks from *text* for accent-insensitive FTS indexing.
+
+    Uses Unicode NFD decomposition followed by removal of all combining
+    marks (Unicode category "Mn").  This maps accented characters to their
+    ASCII base letter so that ``"elysees"`` matches ``"élysées"`` in the
+    trigram index.
+
+    The display strings in the ``strings`` table are **not** altered – only
+    the text that is fed into the FTS5 index (and query) is normalised, so
+    search results always return the correctly accented original names.
+
+    Example
+    -------
+    >>> normalize_for_fts("Champs Élysées")
+    'Champs Elysees'
+    """
+    return "".join(
+        c for c in unicodedata.normalize("NFD", text)
+        if unicodedata.category(c) != "Mn"
+    )
 
 # ---------------------------------------------------------------------------
 # Storage scale constants
@@ -86,6 +114,53 @@ LAT_LON_SCALE: int = 1_000_000
 #: importance is stored as ``round(value * IMPORTANCE_SCALE)`` (INTEGER).
 #: 2 decimal digits are sufficient for scoring.
 IMPORTANCE_SCALE: int = 100
+
+
+def grid_lon_range(grid_size_scaled: int) -> int:
+    """Number of longitude grid cells per full circle for *grid_size_scaled*.
+
+    Used to pack (lat_bucket, lon_bucket) into a single deterministic integer
+    ``grid_id``.  Always larger than the maximum |lon_bucket| to avoid
+    collisions.
+
+    *grid_size_scaled* is ``round(grid_size_degrees * LAT_LON_SCALE)``.
+    Passing 0 is invalid (no-grid mode uses ``place_id`` directly).
+    """
+    return (360_000_000 // grid_size_scaled) + 2
+
+
+def compute_grid_id(lat_int: int, lon_int: int, grid_size_scaled: int) -> int:
+    """Return a deterministic integer grid-cell ID for scaled coordinates.
+
+    The ID is computed from the (lat, lon) bucket indices alone, so it is
+    identical across all worker processes for the same coordinates and
+    *grid_size_scaled*.  No merge-time remapping is needed.
+    """
+    lat_bucket = lat_int // grid_size_scaled
+    lon_bucket = lon_int // grid_size_scaled
+    lon_range = grid_lon_range(grid_size_scaled)
+    return lat_bucket * lon_range + (lon_bucket + lon_range // 2)
+
+
+def compute_grid_bounds(
+    lat_int: int, lon_int: int, grid_size_scaled: int
+) -> tuple:
+    """Return ``(grid_id, min_lat, max_lat, min_lon, max_lon)`` for the cell
+    containing *lat_int*, *lon_int* (both already scaled by LAT_LON_SCALE).
+
+    The bounds cover the full grid cell so that the R-tree entry correctly
+    represents every place assigned to this cell.
+    """
+    lat_bucket = lat_int // grid_size_scaled
+    lon_bucket = lon_int // grid_size_scaled
+    lon_range = grid_lon_range(grid_size_scaled)
+    grid_id = lat_bucket * lon_range + (lon_bucket + lon_range // 2)
+    min_lat = lat_bucket * grid_size_scaled
+    max_lat = min_lat + grid_size_scaled - 1
+    min_lon = lon_bucket * grid_size_scaled
+    max_lon = min_lon + grid_size_scaled - 1
+    return grid_id, min_lat, max_lat, min_lon, max_lon
+
 
 # ---------------------------------------------------------------------------
 # Fixed normalisation mappings
@@ -184,19 +259,12 @@ CREATE TABLE IF NOT EXISTS strings (
     value TEXT UNIQUE NOT NULL
 );
 
--- Interned OSM category strings (e.g. "amenity.restaurant").
--- Same AUTOINCREMENT + merge-remap approach as strings.
-CREATE TABLE IF NOT EXISTS categories (
-    id   INTEGER PRIMARY KEY,
-    name TEXT UNIQUE NOT NULL
-);
-
--- Interned OSM tag tokens: individual parts from split categories.
+-- Interned OSM tag tokens: individual parts from split category strings.
 -- ``token`` is the raw string (e.g., "natural", "peak", "amenity").
 -- ``ctx`` is the translation lookup key and is UNIQUE:
 --   - for a key token: ctx == token  (e.g., "natural")
 --   - for a value token: ctx == "{parent_key}={token}"  (e.g., "natural=peak")
--- Merge-remapped via ``_tmap`` (same pattern as strings / categories).
+-- Merge-remapped via ``_tmap`` (same pattern as strings).
 CREATE TABLE IF NOT EXISTS osm_tags (
     id    INTEGER PRIMARY KEY,
     token TEXT NOT NULL,
@@ -240,6 +308,10 @@ CREATE TABLE IF NOT EXISTS country_names (
 --    is stable across worker databases, eliminating the need for _pmap remapping.
 -- ``osm_key_id`` / ``osm_value_id`` reference osm_tags(id), NOT strings(id).
 -- They share the same interning table as split category parts.
+-- ``grid_id`` is the R-tree grid cell ID for this place.  When no grid is used
+--    (grid_size = 0) this equals the place ``id``.  When a grid is configured
+--    it equals compute_grid_id(lat, lon, grid_size_scaled) and multiple places
+--    in the same cell share the same grid_id — reducing rtree table size.
 -- ``extra`` is an optional gzip-compressed JSON blob; NULL when not stored.
 CREATE TABLE IF NOT EXISTS places (
     id           INTEGER PRIMARY KEY,
@@ -253,6 +325,7 @@ CREATE TABLE IF NOT EXISTS places (
     hn_id        INTEGER REFERENCES strings(id),
     lat          INTEGER NOT NULL,
     lon          INTEGER NOT NULL,
+    grid_id      INTEGER NOT NULL DEFAULT 0,
     extra        BLOB
 );
 
@@ -277,16 +350,11 @@ CREATE TABLE IF NOT EXISTS place_addresses (
     PRIMARY KEY (place_id, addr_type_id, lang_id)
 );
 
--- Categories assigned to a place.
-CREATE TABLE IF NOT EXISTS place_categories (
-    place_id    INTEGER NOT NULL REFERENCES places(id)      ON DELETE CASCADE,
-    category_id INTEGER NOT NULL REFERENCES categories(id),
-    PRIMARY KEY (place_id, category_id)
-);
-
--- OSM tag tokens assigned to a place from split category parts.
--- Only contains tokens that are NOT already stored as osm_key_id / osm_value_id
--- in the places table — those are already there and would be redundant here.
+-- OSM tag tokens assigned to a place from split category strings.
+-- Contains tokens from the category that are NOT already stored as
+-- osm_key_id / osm_value_id in the places table (no redundancy).
+-- Tokens from categories like "osm.natural.volcano" → ["natural","volcano"]
+-- are stored here (minus the "osm" prefix which is discarded).
 -- Enables efficient "filter by extra category token" queries.
 CREATE TABLE IF NOT EXISTS place_osm_tags (
     place_id INTEGER NOT NULL REFERENCES places(id)  ON DELETE CASCADE,
@@ -306,14 +374,17 @@ CREATE TABLE IF NOT EXISTS fts_data (
 );
 
 -- Staging table for R-tree data.
--- Only the centroid (lat, lon) is stored; the R-tree virtual table receives
--- a degenerate bounding box where min == max (a point), which always satisfies
--- the SQLite R-tree constraint min_lat <= max_lat / min_lon <= max_lon.
+-- Stores grid cell bounds: (id=grid_id, min_lat, max_lat, min_lon, max_lon).
+-- When no grid is used (grid_size=0), id==place_id and min==max (a point).
+-- When a grid is used, id==compute_grid_id(...) and min/max span the cell.
 -- Coordinates are stored as round(degrees * LAT_LON_SCALE) (INTEGER).
+-- INSERT OR IGNORE deduplicates grid cells across places in the same batch.
 CREATE TABLE IF NOT EXISTS rtree_data (
-    id  INTEGER PRIMARY KEY,
-    lat INTEGER NOT NULL,
-    lon INTEGER NOT NULL
+    id      INTEGER PRIMARY KEY,
+    min_lat INTEGER NOT NULL,
+    max_lat INTEGER NOT NULL,
+    min_lon INTEGER NOT NULL,
+    max_lon INTEGER NOT NULL
 );
 """
 
@@ -333,10 +404,10 @@ CREATE VIRTUAL TABLE IF NOT EXISTS places_fts USING fts5(
 
 # R-tree virtual table for fast bounding-box reverse geocoding.
 # Uses ``rtree_i32`` so that coordinates are stored as 32-bit signed integers
-# rather than 64-bit doubles.  Centroid stored as a degenerate box:
-# min_lat == max_lat, min_lon == max_lon (same scaled value as places.lat/lon).
-# This halves the per-entry coordinate storage cost and preserves full integer
-# precision at LAT_LON_SCALE (≈ 0.1 m resolution at the equator).
+# rather than 64-bit doubles.
+# ``id`` references a grid cell (or place_id in no-grid mode).
+# Cell bounds are ``(min_lat, max_lat, min_lon, max_lon)`` in scaled integers
+# (×LAT_LON_SCALE).  In no-grid mode min==max (centroid point).
 _RTREE = """
 CREATE VIRTUAL TABLE IF NOT EXISTS places_rtree USING rtree_i32(
     id,
@@ -349,10 +420,10 @@ _INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_places_country    ON places(country_code);
 CREATE INDEX IF NOT EXISTS idx_places_osm        ON places(osm_id);
 CREATE INDEX IF NOT EXISTS idx_places_importance ON places(importance DESC);
+CREATE INDEX IF NOT EXISTS idx_places_grid_id    ON places(grid_id);
 CREATE INDEX IF NOT EXISTS idx_place_names_place ON place_names(place_id);
 CREATE INDEX IF NOT EXISTS idx_place_names_lang  ON place_names(lang_id, kind_id);
 CREATE INDEX IF NOT EXISTS idx_place_addr_place  ON place_addresses(place_id);
-CREATE INDEX IF NOT EXISTS idx_place_cat_place   ON place_categories(place_id);
 CREATE INDEX IF NOT EXISTS idx_country_names     ON country_names(code);
 CREATE INDEX IF NOT EXISTS idx_osm_tags_ctx       ON osm_tags(ctx);
 CREATE INDEX IF NOT EXISTS idx_osm_tag_names_tag  ON osm_tag_names(tag_id);

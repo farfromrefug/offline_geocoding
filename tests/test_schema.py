@@ -34,16 +34,18 @@ def test_create_database(tmp_path):
         "countries",
         "country_names",
         "strings",
-        "categories",
         "osm_tags",
         "osm_tag_names",
         "places",
         "place_names",
         "place_addresses",
-        "place_categories",
         "place_osm_tags",
     ):
         assert expected in tables, f"Missing table: {expected}"
+
+    # categories and place_categories tables must NOT exist.
+    assert "categories" not in tables, "categories table should have been removed"
+    assert "place_categories" not in tables, "place_categories table should have been removed"
 
     # name_kinds table must NOT exist — kind_id uses hardcoded NAME_KIND_IDS.
     assert "name_kinds" not in tables, "name_kinds table should have been removed"
@@ -204,14 +206,14 @@ def test_create_worker_database(tmp_path):
     assert "places_fts" not in tables
     assert "places_rtree" not in tables
 
-    # rtree_data staging table: only (id, lat, lon) – no min/max bbox.
+    # rtree_data staging table: full bounding box (min/max lat/lon).
     col_names = [
         r[1] for r in conn.execute("PRAGMA table_info(rtree_data)").fetchall()
     ]
-    assert "lat" in col_names
-    assert "lon" in col_names
-    assert "min_lat" not in col_names
-    assert "max_lat" not in col_names
+    assert "min_lat" in col_names
+    assert "max_lat" in col_names
+    assert "min_lon" in col_names
+    assert "max_lon" in col_names
     conn.close()
 
 
