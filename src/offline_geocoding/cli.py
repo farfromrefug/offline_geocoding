@@ -98,7 +98,7 @@ def _print_result(result: dict, index: int) -> None:
             addr_parts.append(val)
     if addr_parts:
         click.echo(f"       address: {', '.join(addr_parts)}")
-    if result.get("importance"):
+    if result.get("importance") is not None:
         click.echo(f"       importance={result['importance']:.4f}")
     if result.get("distance_deg") is not None:
         click.echo(f"       distance={result['distance_deg']:.6f}°")

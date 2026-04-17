@@ -342,40 +342,77 @@ def _format_place(
 def _run_fts_search(
     conn: sqlite3.Connection,
     fts_query: str,
+    name_boost_query: Optional[str],
     languages: Optional[List[str]],
     bbox: Optional[Tuple[float, float, float, float]],
     limit: int,
     offset: int,
 ) -> List[Dict[str, Any]]:
-    """Execute a pre-built FTS5 MATCH query and format results."""
+    """Execute a pre-built FTS5 MATCH query and format results.
+
+    Parameters
+    ----------
+    fts_query:
+        FTS5 MATCH expression that may span both ``names`` and ``address``
+        columns (all-columns implicit AND).
+    name_boost_query:
+        Optional names-column-restricted MATCH expression used to compute a
+        ``name_match`` ranking boost.  When provided, places whose name
+        satisfies the query are sorted above places that only match in the
+        address column.  Computed via ``_escape_fts_column(q, "names")``.
+    """
+    # Build the name_match boost CTE when a names-restricted query is given.
+    if name_boost_query:
+        cte_prefix = """WITH name_hits AS (
+                SELECT rowid AS place_id
+                FROM places_fts
+                WHERE places_fts MATCH ?
+            )
+            """
+        name_join = "LEFT JOIN name_hits nh ON nh.place_id = p.id"
+        name_col  = ", CASE WHEN nh.place_id IS NOT NULL THEN 1 ELSE 0 END AS name_match"
+        order_prefix = "name_match DESC, "
+        extra_params: tuple = (name_boost_query,)
+    else:
+        cte_prefix   = ""
+        name_join    = ""
+        name_col     = ""
+        order_prefix = ""
+        extra_params = ()
+
     if bbox is not None:
         min_lon, min_lat, max_lon, max_lat = bbox
-        sql = """
-            SELECT p.*
+        sql = f"""
+            {cte_prefix}
+            SELECT p.* {name_col}
             FROM places_fts fts
             JOIN places p ON p.id = fts.rowid
+            {name_join}
             WHERE places_fts MATCH ?
               AND p.lat BETWEEN ? AND ?
               AND p.lon BETWEEN ? AND ?
-            ORDER BY fts.rank, p.importance DESC
+            ORDER BY {order_prefix}fts.rank, p.importance DESC
             LIMIT ? OFFSET ?
         """
         params: tuple = (
+            *extra_params,
             fts_query,
             round(min_lat * LAT_LON_SCALE), round(max_lat * LAT_LON_SCALE),
             round(min_lon * LAT_LON_SCALE), round(max_lon * LAT_LON_SCALE),
             limit, offset,
         )
     else:
-        sql = """
-            SELECT p.*
+        sql = f"""
+            {cte_prefix}
+            SELECT p.* {name_col}
             FROM places_fts fts
             JOIN places p ON p.id = fts.rowid
+            {name_join}
             WHERE places_fts MATCH ?
-            ORDER BY fts.rank, p.importance DESC
+            ORDER BY {order_prefix}fts.rank, p.importance DESC
             LIMIT ? OFFSET ?
         """
-        params = (fts_query, limit, offset)
+        params = (*extra_params, fts_query, limit, offset)
 
     rows = conn.execute(sql, params).fetchall()
     country_cache: Dict[str, Optional[str]] = {}
@@ -423,8 +460,11 @@ def search(
         fts_query = _escape_fts(query)
         if not fts_query:
             return []
+        # Boost places where all query terms appear in the name column so they
+        # rank above places that only match in the address column.
+        name_boost = _escape_fts_column(query, "names") or None
         return _run_fts_search(
-            conn, fts_query, languages, bbox, limit, offset
+            conn, fts_query, name_boost, languages, bbox, limit, offset
         )
     finally:
         if should_close:
@@ -450,8 +490,10 @@ def search_column(
         fts_query = _escape_fts_column(query, column)
         if not fts_query:
             return []
+        # Already column-restricted — all matches are in the chosen column;
+        # no additional name_match boost needed.
         return _run_fts_search(
-            conn, fts_query, languages, bbox, limit, offset
+            conn, fts_query, None, languages, bbox, limit, offset
         )
     finally:
         if should_close:

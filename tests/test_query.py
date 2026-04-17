@@ -290,3 +290,197 @@ def test_reverse_distance_field(db_path):
     assert len(results) >= 1
     assert "distance_deg" in results[0]
     assert results[0]["distance_deg"] >= 0.0
+
+
+# ---------------------------------------------------------------------------
+# importance field in result
+# ---------------------------------------------------------------------------
+
+def test_importance_always_in_result(db_path):
+    """Every search result must include an 'importance' key."""
+    results = search(db_path, "Paris", limit=5)
+    for r in results:
+        assert "importance" in r, "importance key missing from result"
+
+
+def test_zero_importance_in_result(db_path):
+    """importance=0.0 must be present as a float (not silently dropped)."""
+    # Paris and London have non-zero importance; Eiffel Tower has 0.7.
+    # Any place that happens to be stored with importance=0 must still have
+    # the key present and equal to 0.0.
+    results = search(db_path, "Paris", limit=10)
+    for r in results:
+        assert r.get("importance") is not None
+        assert isinstance(r["importance"], float)
+
+
+# ---------------------------------------------------------------------------
+# Name-match ranking boost
+# ---------------------------------------------------------------------------
+
+# Two extra fixture places to test name-match-vs-address-match ordering.
+# "Tour Eiffel Garden" has both "Tour" and "Eiffel" in the NAME.
+# "Grand Palais" has "Tour" in one address component and "Eiffel" in another,
+# but neither in its name.  A higher importance is deliberately given to the
+# address-only match to verify that the name_match boost overrides importance.
+_RANKING_NAME_MATCH_ENTRY = {
+    "place_id": 20,
+    "object_type": "W",
+    "object_id": 20000,
+    "osm_key": "tourism",
+    "osm_value": "attraction",
+    "address_type": "other",
+    "importance": 0.1,
+    "name": {"name": "Tour Eiffel Garden"},
+    "address": {"city": "Paris", "country": "France"},
+    "country_code": "fr",
+    "centroid": [2.295, 48.858],
+    "categories": ["tourism.attraction"],
+}
+
+_RANKING_ADDR_MATCH_ENTRY = {
+    "place_id": 21,
+    "object_type": "W",
+    "object_id": 21000,
+    "osm_key": "tourism",
+    "osm_value": "museum",
+    "address_type": "other",
+    "importance": 0.9,   # higher importance than _RANKING_NAME_MATCH_ENTRY
+    "name": {"name": "Grand Palais"},
+    # "Tour" is in 'district' and "Eiffel" is in a separate 'street' value so
+    # both substrings appear in the FTS address column but not in the name.
+    "address": {
+        "district": "Tour District",
+        "street": "Rue Eiffel",
+        "country": "France",
+    },
+    "country_code": "fr",
+    "centroid": [2.30, 48.86],
+    "categories": ["tourism.museum"],
+}
+
+
+@pytest.fixture(scope="module")
+def ranking_db_path(tmp_path_factory):
+    tmp = tmp_path_factory.mktemp("ranking_db")
+    jsonl_path = str(tmp / "dump.jsonl")
+    Path(jsonl_path).write_bytes(
+        _make_jsonl([_RANKING_NAME_MATCH_ENTRY, _RANKING_ADDR_MATCH_ENTRY])
+    )
+    db = str(tmp / "ranking.db")
+    import_database(
+        input_path=jsonl_path,
+        output_path=db,
+        languages=["en", "fr"],
+        num_workers=1,
+        show_progress=False,
+        tag_filter=set(),
+    )
+    return db
+
+
+def test_name_match_ranks_above_address_only_match(ranking_db_path):
+    """Places matching the query in their NAME rank above address-only matches.
+
+    This is a regression test for the name_match boost introduced in
+    ``_run_fts_search``.  Without the boost the higher-importance address-only
+    match ("Grand Palais", importance=0.9) would outrank the lower-importance
+    name match ("Tour Eiffel Garden", importance=0.1).
+    """
+    results = search(ranking_db_path, "Tour Eiffel", limit=10)
+    names = [r["name"] for r in results]
+
+    assert "Tour Eiffel Garden" in names, (
+        "'Tour Eiffel Garden' (name match) not in results"
+    )
+    assert "Grand Palais" in names, (
+        "'Grand Palais' (address match) not in results"
+    )
+
+    name_idx = names.index("Tour Eiffel Garden")
+    addr_idx = names.index("Grand Palais")
+    assert name_idx < addr_idx, (
+        f"Name match 'Tour Eiffel Garden' (rank {name_idx}) should appear "
+        f"before address-only match 'Grand Palais' (rank {addr_idx}), "
+        f"despite 'Grand Palais' having higher importance"
+    )
+
+
+def test_name_match_zero_importance_in_ranking_db(ranking_db_path):
+    """importance=0.1 for a name-match place is returned as a float."""
+    results = search(ranking_db_path, "Tour Eiffel Garden", limit=1)
+    assert results, "Expected at least one result for 'Tour Eiffel Garden'"
+    r = results[0]
+    assert r["name"] == "Tour Eiffel Garden"
+    assert "importance" in r
+    assert isinstance(r["importance"], float)
+    assert abs(r["importance"] - 0.1) < 0.01
+
+
+# ---------------------------------------------------------------------------
+# CLI _print_result importance display
+# ---------------------------------------------------------------------------
+
+def test_cli_print_result_shows_importance_zero(capsys):
+    """_print_result must display importance even when it is 0.0."""
+    from offline_geocoding.cli import _print_result
+
+    result = {
+        "name": "Zero Importance Place",
+        "lat": 48.8,
+        "lon": 2.3,
+        "address_type": None,
+        "osm_key": None,
+        "osm_value": None,
+        "importance": 0.0,
+        "distance_deg": None,
+        "address": {},
+        "categories": [],
+    }
+    _print_result(result, 1)
+    captured = capsys.readouterr()
+    assert "importance=0.0000" in captured.out, (
+        "importance=0.0000 should be shown even for zero-importance places"
+    )
+
+
+def test_cli_print_result_shows_importance_nonzero(capsys):
+    """_print_result displays non-zero importance correctly."""
+    from offline_geocoding.cli import _print_result
+
+    result = {
+        "name": "Important Place",
+        "lat": 48.8,
+        "lon": 2.3,
+        "address_type": None,
+        "osm_key": None,
+        "osm_value": None,
+        "importance": 0.75,
+        "distance_deg": None,
+        "address": {},
+        "categories": [],
+    }
+    _print_result(result, 1)
+    captured = capsys.readouterr()
+    assert "importance=0.7500" in captured.out
+
+
+def test_cli_print_result_no_importance_when_none(capsys):
+    """_print_result does not crash when importance is absent from the dict."""
+    from offline_geocoding.cli import _print_result
+
+    result = {
+        "name": "No Importance Key",
+        "lat": 48.8,
+        "lon": 2.3,
+        "address_type": None,
+        "osm_key": None,
+        "osm_value": None,
+        # 'importance' key deliberately absent
+        "distance_deg": None,
+        "address": {},
+        "categories": [],
+    }
+    _print_result(result, 1)   # must not raise
+    captured = capsys.readouterr()
+    assert "importance" not in captured.out
