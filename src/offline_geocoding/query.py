@@ -359,62 +359,59 @@ def _run_fts_search(
         Optional names-column-restricted MATCH expression used to compute a
         ``name_match`` ranking boost.  When provided, places whose name
         satisfies the query are sorted above places that only match in the
-        address column.  Computed via ``_escape_fts_column(q, "names")``.
+        address column.  Resolved via a *separate* SQL query before the main
+        search so that only one ``MATCH`` cursor is open per SQL statement
+        (SQLite FTS5 does not support two MATCH predicates against the same
+        virtual table within a single statement).
     """
-    # Build the name_match boost CTE when a names-restricted query is given.
+    # SQLite FTS5 limitation: only one MATCH predicate per virtual table per
+    # SQL statement.  We resolve the name-match set in a separate query first,
+    # then sort in Python so the main query stays single-MATCH.
+    name_hit_ids: Optional[set] = None
     if name_boost_query:
-        cte_prefix = """WITH name_hits AS (
-                SELECT rowid AS place_id
-                FROM places_fts
-                WHERE places_fts MATCH ?
-            )
-            """
-        name_join = "LEFT JOIN name_hits nh ON nh.place_id = p.id"
-        name_col  = ", CASE WHEN nh.place_id IS NOT NULL THEN 1 ELSE 0 END AS name_match"
-        order_prefix = "name_match DESC, "
-        extra_params: tuple = (name_boost_query,)
-    else:
-        cte_prefix   = ""
-        name_join    = ""
-        name_col     = ""
-        order_prefix = ""
-        extra_params = ()
+        name_rows = conn.execute(
+            "SELECT rowid FROM places_fts WHERE places_fts MATCH ?",
+            (name_boost_query,),
+        ).fetchall()
+        name_hit_ids = {r[0] for r in name_rows}
 
     if bbox is not None:
         min_lon, min_lat, max_lon, max_lat = bbox
-        sql = f"""
-            {cte_prefix}
-            SELECT p.* {name_col}
+        sql = """
+            SELECT p.*
             FROM places_fts fts
             JOIN places p ON p.id = fts.rowid
-            {name_join}
             WHERE places_fts MATCH ?
               AND p.lat BETWEEN ? AND ?
               AND p.lon BETWEEN ? AND ?
-            ORDER BY {order_prefix}fts.rank, p.importance DESC
+            ORDER BY fts.rank, p.importance DESC
             LIMIT ? OFFSET ?
         """
         params: tuple = (
-            *extra_params,
             fts_query,
             round(min_lat * LAT_LON_SCALE), round(max_lat * LAT_LON_SCALE),
             round(min_lon * LAT_LON_SCALE), round(max_lon * LAT_LON_SCALE),
             limit, offset,
         )
     else:
-        sql = f"""
-            {cte_prefix}
-            SELECT p.* {name_col}
+        sql = """
+            SELECT p.*
             FROM places_fts fts
             JOIN places p ON p.id = fts.rowid
-            {name_join}
             WHERE places_fts MATCH ?
-            ORDER BY {order_prefix}fts.rank, p.importance DESC
+            ORDER BY fts.rank, p.importance DESC
             LIMIT ? OFFSET ?
         """
-        params = (*extra_params, fts_query, limit, offset)
+        params = (fts_query, limit, offset)
 
     rows = conn.execute(sql, params).fetchall()
+
+    # Apply name_match boost in Python: stable-sort so that places whose id
+    # appears in name_hit_ids float to the top (preserving the SQL rank order
+    # within each group).
+    if name_hit_ids is not None:
+        rows = sorted(rows, key=lambda r: (0 if r["id"] in name_hit_ids else 1))
+
     country_cache: Dict[str, Optional[str]] = {}
     return [_format_place(conn, r, languages, country_cache) for r in rows]
 
