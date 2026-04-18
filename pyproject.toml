@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "offline-geocoding"
+version = "0.1.0"
+description = "Build and query an offline geocoding/reverse-geocoding SQLite database from Photon JSONL dump files"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["geocoding", "offline", "photon", "openstreetmap", "sqlite", "fts5", "rtree"]
+dependencies = [
+    "zstandard>=0.19",
+    "click>=8.0",
+    "tqdm>=4.60",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "pytest-cov"]
+
+[project.scripts]
+offline-geocoding = "offline_geocoding.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
