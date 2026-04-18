@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import sqlite3
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -59,6 +60,59 @@ _KIND_BY_ID: Dict[int, str] = {v: k for k, v in NAME_KIND_IDS.items()}
 
 #: Integer addr_type_id -> addr_type string (e.g. 4 -> "city")
 _ADDR_TYPE_BY_ID: Dict[int, str] = {v: k for k, v in ADDR_TYPE_IDS.items()}
+
+# ---------------------------------------------------------------------------
+# Candidate-pool sizing for Python-side reranking
+# ---------------------------------------------------------------------------
+
+#: How many times ``limit`` to fetch from SQL before Python reranking.
+_CANDIDATE_POOL_FACTOR: int = 10
+#: Hard upper bound on pool size (avoids excessive DB load for large limits).
+_CANDIDATE_POOL_MAX: int = 500
+
+
+def _name_match_tier(name_strings: List[str], tokens: List[str]) -> int:
+    """Classify how well *tokens* match a place's name strings.
+
+    Returns an integer tier (lower is better):
+
+    * **0** – all tokens are full words **and** the name starts with the first
+      token (e.g. query "parc" → name "Parc Floral").
+    * **1** – all tokens are full words anywhere in the name
+      (e.g. query "parc" → name "Pointe du Parc").
+    * **2** – all tokens appear as substrings (trigram match) but not as
+      full words (e.g. query "parc" → name "Parcours Sportif").
+    * **3** – no name match at all; the place only matched via its address
+      column (e.g. a ride inside "Parc Astérix" whose own name is "Toutatis").
+
+    Diacritics are stripped with :func:`normalize_for_fts` before comparison
+    so that accented queries still classify correctly.
+    """
+    if not tokens:
+        return 3
+    # Normalise tokens the same way the name is normalised so that
+    # case and diacritics don't prevent a match.
+    lower_tokens = [normalize_for_fts(t).lower() for t in tokens]
+    best = 3
+    for name in name_strings:
+        norm = normalize_for_fts(name or "").lower()
+        if not norm:
+            continue
+        # Build a regex that requires every token to be a full word.
+        word_match = all(
+            re.search(r"\b" + re.escape(t) + r"\b", norm)
+            for t in lower_tokens
+        )
+        if word_match:
+            tier = 0 if norm.startswith(lower_tokens[0]) else 1
+        elif all(t in norm for t in lower_tokens):
+            tier = 2
+        else:
+            continue
+        best = min(best, tier)
+        if best == 0:
+            break  # can't improve further
+    return best
 
 # ---------------------------------------------------------------------------
 # Connection helper
@@ -342,38 +396,46 @@ def _format_place(
 def _run_fts_search(
     conn: sqlite3.Connection,
     fts_query: str,
-    name_boost_query: Optional[str],
+    query_tokens: List[str],
     languages: Optional[List[str]],
     bbox: Optional[Tuple[float, float, float, float]],
     limit: int,
     offset: int,
 ) -> List[Dict[str, Any]]:
-    """Execute a pre-built FTS5 MATCH query and format results.
+    """Execute a pre-built FTS5 MATCH query, rerank, and return formatted results.
 
     Parameters
     ----------
     fts_query:
-        FTS5 MATCH expression that may span both ``names`` and ``address``
-        columns (all-columns implicit AND).
-    name_boost_query:
-        Optional names-column-restricted MATCH expression used to compute a
-        ``name_match`` ranking boost.  When provided, places whose name
-        satisfies the query are sorted above places that only match in the
-        address column.  Resolved via a *separate* SQL query before the main
-        search so that only one ``MATCH`` cursor is open per SQL statement
-        (SQLite FTS5 does not support two MATCH predicates against the same
-        virtual table within a single statement).
+        FTS5 MATCH expression (all columns, implicit AND).
+    query_tokens:
+        Normalised token list produced by :func:`_fts_tokens`.  Used for
+        Python-side tiered ranking based on word-boundary matching.  Pass an
+        empty list to skip name-tier classification (e.g. for address-only
+        column searches).
+
+    Ranking strategy
+    ----------------
+    Trigram FTS cannot distinguish "Parc Floral" from "Parcours Sportif" for
+    the query "parc" — both contain the trigrams ``par`` and ``arc``.  To
+    produce sensible results we:
+
+    1. Fetch a large candidate pool (up to ``_CANDIDATE_POOL_FACTOR × limit``
+       rows) ordered by FTS rank so that good trigram matches come first.
+    2. Batch-lookup all name strings for those candidates in a single query.
+    3. Classify each candidate into a *tier* using :func:`_name_match_tier`.
+    4. Sort by ``(tier, -importance)`` in Python — importance breaks ties
+       within the same tier.
+    5. Slice to ``[offset : offset + limit]`` and format.
     """
-    # SQLite FTS5 limitation: only one MATCH predicate per virtual table per
-    # SQL statement.  We resolve the name-match set in a separate query first,
-    # then sort in Python so the main query stays single-MATCH.
-    name_hit_ids: Optional[set] = None
-    if name_boost_query:
-        name_rows = conn.execute(
-            "SELECT rowid FROM places_fts WHERE places_fts MATCH ?",
-            (name_boost_query,),
-        ).fetchall()
-        name_hit_ids = {r[0] for r in name_rows}
+    # Size the candidate pool: large enough to include high-importance places
+    # that may sit beyond the top ``limit`` FTS-rank positions, yet bounded to
+    # avoid excessive DB work.
+    # Formula: max(limit × FACTOR, offset + limit) — ensures the pool covers
+    # the full requested page even for large offsets — then capped at MAX but
+    # never below offset + limit so pagination always has enough candidates.
+    pool_size = max(limit * _CANDIDATE_POOL_FACTOR, offset + limit)
+    pool_size = min(pool_size, max(_CANDIDATE_POOL_MAX, offset + limit))
 
     if bbox is not None:
         min_lon, min_lat, max_lon, max_lat = bbox
@@ -384,14 +446,14 @@ def _run_fts_search(
             WHERE places_fts MATCH ?
               AND p.lat BETWEEN ? AND ?
               AND p.lon BETWEEN ? AND ?
-            ORDER BY fts.rank, p.importance DESC
-            LIMIT ? OFFSET ?
+            ORDER BY fts.rank
+            LIMIT ?
         """
         params: tuple = (
             fts_query,
             round(min_lat * LAT_LON_SCALE), round(max_lat * LAT_LON_SCALE),
             round(min_lon * LAT_LON_SCALE), round(max_lon * LAT_LON_SCALE),
-            limit, offset,
+            pool_size,
         )
     else:
         sql = """
@@ -399,21 +461,43 @@ def _run_fts_search(
             FROM places_fts fts
             JOIN places p ON p.id = fts.rowid
             WHERE places_fts MATCH ?
-            ORDER BY fts.rank, p.importance DESC
-            LIMIT ? OFFSET ?
+            ORDER BY fts.rank
+            LIMIT ?
         """
-        params = (fts_query, limit, offset)
+        params = (fts_query, pool_size)
 
     rows = conn.execute(sql, params).fetchall()
+    if not rows:
+        return []
 
-    # Apply name_match boost in Python: stable-sort so that places whose id
-    # appears in name_hit_ids float to the top (preserving the SQL rank order
-    # within each group).
-    if name_hit_ids is not None:
-        rows = sorted(rows, key=lambda r: (0 if r["id"] in name_hit_ids else 1))
+    # Batch-lookup all name strings for ranking (single query, no N+1).
+    place_ids = [r["id"] for r in rows]
+    placeholders = ",".join("?" * len(place_ids))
+    name_rows = conn.execute(
+        f"""
+        SELECT pn.place_id, s.value
+        FROM place_names pn
+        JOIN strings s ON s.id = pn.string_id
+        WHERE pn.place_id IN ({placeholders})
+        """,
+        place_ids,
+    ).fetchall()
+    names_by_place: Dict[int, List[str]] = {}
+    for nr in name_rows:
+        names_by_place.setdefault(nr["place_id"], []).append(nr["value"])
 
+    # Sort by (tier, -importance [stored as int], original FTS-rank index).
+    def _sort_key(idx_row: Tuple[int, sqlite3.Row]) -> Tuple[int, int, int]:
+        idx, row = idx_row
+        tier = _name_match_tier(names_by_place.get(row["id"], []), query_tokens)
+        return (tier, -row["importance"], idx)
+
+    ranked = sorted(enumerate(rows), key=_sort_key)
+
+    # Apply Python-side pagination and format only the final page.
+    page = ranked[offset : offset + limit]
     country_cache: Dict[str, Optional[str]] = {}
-    return [_format_place(conn, r, languages, country_cache) for r in rows]
+    return [_format_place(conn, rows[idx], languages, country_cache) for idx, _ in page]
 
 
 def search(
@@ -454,14 +538,12 @@ def search(
 
     conn, should_close = _conn(db)
     try:
-        fts_query = _escape_fts(query)
+        tokens = _fts_tokens(query)
+        fts_query = " ".join(tokens)
         if not fts_query:
             return []
-        # Boost places where all query terms appear in the name column so they
-        # rank above places that only match in the address column.
-        name_boost = _escape_fts_column(query, "names") or None
         return _run_fts_search(
-            conn, fts_query, name_boost, languages, bbox, limit, offset
+            conn, fts_query, tokens, languages, bbox, limit, offset
         )
     finally:
         if should_close:
@@ -484,13 +566,16 @@ def search_column(
         return []
     conn, should_close = _conn(db)
     try:
-        fts_query = _escape_fts_column(query, column)
+        tokens = _fts_tokens(query)
+        fts_query = " ".join(f"{column}:{t}" for t in tokens)
         if not fts_query:
             return []
-        # Already column-restricted — all matches are in the chosen column;
-        # no additional name_match boost needed.
+        # For name-column searches apply word-boundary tier ranking; for
+        # address-column searches all results are address matches so pass
+        # empty tokens to skip name-tier classification (importance sorts them).
+        rank_tokens = tokens if column == "names" else []
         return _run_fts_search(
-            conn, fts_query, None, languages, bbox, limit, offset
+            conn, fts_query, rank_tokens, languages, bbox, limit, offset
         )
     finally:
         if should_close:

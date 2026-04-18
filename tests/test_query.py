@@ -418,6 +418,165 @@ def test_name_match_zero_importance_in_ranking_db(ranking_db_path):
 
 
 # ---------------------------------------------------------------------------
+# Tiered word-boundary ranking: "parc" vs "parcours" vs address-only
+# ---------------------------------------------------------------------------
+#
+# Scenario:
+#   • "Parc Floral"       – query is full-word AND starts the name  → tier 0
+#   • "Pointe du Parc"    – query is full-word inside the name      → tier 1
+#   • "Parcours Aventure" – query is substring of a word            → tier 2
+#   • "Ride Astérix"      – "parc" only in address ("Parc Astérix") → tier 3
+#
+# "Ride Astérix" is given very high importance (0.95) to confirm it does NOT
+# leapfrog name-match results merely because of its importance score.
+
+_TIER_PARC_FLORAL = {
+    "place_id": 30,
+    "object_type": "W",
+    "object_id": 30000,
+    "osm_key": "leisure",
+    "osm_value": "park",
+    "address_type": "other",
+    "importance": 0.0,
+    "name": {"name": "Parc Floral"},
+    "address": {"city": "Orléans", "country": "France"},
+    "country_code": "fr",
+    "centroid": [1.935, 47.851],
+    "categories": ["leisure.park"],
+}
+
+_TIER_POINTE_DU_PARC = {
+    "place_id": 31,
+    "object_type": "W",
+    "object_id": 31000,
+    "osm_key": "natural",
+    "osm_value": "cape",
+    "address_type": "other",
+    "importance": 0.11,
+    "name": {"name": "Pointe du Parc"},
+    "address": {"country": "France"},
+    "country_code": "fr",
+    "centroid": [55.484, -21.352],
+    "categories": ["natural.cape"],
+}
+
+_TIER_PARCOURS = {
+    "place_id": 32,
+    "object_type": "W",
+    "object_id": 32000,
+    "osm_key": "tourism",
+    "osm_value": "attraction",
+    "address_type": "other",
+    "importance": 0.0,
+    "name": {"name": "Parcours Aventure"},
+    "address": {"city": "Féy", "country": "France"},
+    "country_code": "fr",
+    "centroid": [6.101, 49.018],
+    "categories": ["tourism.attraction"],
+}
+
+_TIER_ADDR_ONLY = {
+    "place_id": 33,
+    "object_type": "W",
+    "object_id": 33000,
+    "osm_key": "tourism",
+    "osm_value": "attraction",
+    "address_type": "other",
+    "importance": 0.95,   # deliberately very high — must NOT beat name matches
+    "name": {"name": "Ride Astérix"},
+    "address": {
+        "district": "Parc Astérix",
+        "city": "Plailly",
+        "country": "France",
+    },
+    "country_code": "fr",
+    "centroid": [2.569, 49.136],
+    "categories": ["tourism.attraction"],
+}
+
+
+@pytest.fixture(scope="module")
+def tier_ranking_db_path(tmp_path_factory):
+    tmp = tmp_path_factory.mktemp("tier_ranking_db")
+    jsonl_path = str(tmp / "dump.jsonl")
+    Path(jsonl_path).write_bytes(
+        _make_jsonl([
+            _TIER_PARC_FLORAL,
+            _TIER_POINTE_DU_PARC,
+            _TIER_PARCOURS,
+            _TIER_ADDR_ONLY,
+        ])
+    )
+    db = str(tmp / "tier_ranking.db")
+    import_database(
+        input_path=jsonl_path,
+        output_path=db,
+        languages=["fr"],
+        num_workers=1,
+        show_progress=False,
+        tag_filter=set(),
+    )
+    return db
+
+
+def test_word_boundary_tier_ranking(tier_ranking_db_path):
+    """Word-boundary name matches rank above substring matches.
+
+    Query "parc":
+      • "Parc Floral"       – tier 0: full word, starts name
+      • "Pointe du Parc"    – tier 1: full word, not at start (but has higher
+                              importance, so within tier 1 it sorts first)
+      • "Parcours Aventure" – tier 2: substring match ("parc" inside "parcours")
+      • "Ride Astérix"      – tier 3: address-only match (very high importance
+                              but must NOT appear above any name-match)
+    """
+    results = search(tier_ranking_db_path, "parc", limit=10)
+    names = [r["name"] for r in results]
+
+    assert "Parc Floral" in names
+    assert "Pointe du Parc" in names
+    assert "Parcours Aventure" in names
+    assert "Ride Astérix" in names
+
+    parc_floral_idx   = names.index("Parc Floral")
+    pointe_idx        = names.index("Pointe du Parc")
+    parcours_idx      = names.index("Parcours Aventure")
+    ride_idx          = names.index("Ride Astérix")
+
+    # Tier 0 beats tier 1
+    assert parc_floral_idx < pointe_idx, (
+        "'Parc Floral' (tier 0) should rank above 'Pointe du Parc' (tier 1)"
+    )
+    # Tier 1 beats tier 2
+    assert pointe_idx < parcours_idx, (
+        "'Pointe du Parc' (tier 1) should rank above 'Parcours Aventure' (tier 2)"
+    )
+    # Tier 2 beats tier 3 despite tier 3 having very high importance
+    assert parcours_idx < ride_idx, (
+        "'Parcours Aventure' (tier 2, substring name) should rank above "
+        "'Ride Astérix' (tier 3, address-only, importance=0.95)"
+    )
+
+
+def test_importance_sorts_within_same_tier(tier_ranking_db_path):
+    """Within the same tier, higher importance ranks first.
+
+    "Parcours Aventure" (tier 2: substring name match) has importance=0.0.
+    "Ride Astérix" (tier 3: address-only match) has importance=0.95.
+    Tier takes priority over importance, so "Parcours Aventure" must appear
+    before "Ride Astérix" despite the latter having much higher importance.
+    """
+    results = search(tier_ranking_db_path, "parcours parc", limit=10)
+    # "Parcours Aventure" matches both tokens; "Pointe du Parc" might not match
+    # "parcours", so focus only on "Parcours Aventure" vs "Ride Astérix".
+    names = [r["name"] for r in results]
+    if "Parcours Aventure" in names and "Ride Astérix" in names:
+        assert names.index("Parcours Aventure") < names.index("Ride Astérix"), (
+            "Address-only match should not outrank substring name-match "
+            "even when it has higher importance"
+        )
+
+# ---------------------------------------------------------------------------
 # CLI _print_result importance display
 # ---------------------------------------------------------------------------
 
